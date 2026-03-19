@@ -1,6 +1,6 @@
-# VS Code + Claude Code Dual-Monitor Layout Script
+# VS Code Side Panel Layout Script
 # Hotkey: Ctrl+Alt+V
-# Snaps VS Code window to span both bottom monitors with Claude Code panel on right
+# Snaps VS Code window to span both bottom monitors with side panel on right
 
 param(
     [switch]$Once,       # Run Ctrl+Alt+V layout once (dual monitors bottom)
@@ -486,7 +486,7 @@ if ($SingleOnce) {
 
 # Main execution with hotkey listener
 Write-Host "============================================" -ForegroundColor Cyan
-Write-Host "  VS Code Claude Layout Script" -ForegroundColor White
+Write-Host "  VS Code Side Panel Layout Script" -ForegroundColor White
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host "  Ctrl+Alt+V - Dual monitor layout (bottom)" -ForegroundColor Yellow
 Write-Host "  Ctrl+Alt+N - Top monitors layout (panel full)" -ForegroundColor Yellow
