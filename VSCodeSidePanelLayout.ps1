@@ -1,6 +1,7 @@
 # VS Code Side Panel Layout Script
 # Hotkey: Ctrl+Alt+V
 # Snaps VS Code window to span both bottom monitors with side panel on right
+# Uses direct SQLite state.vscdb manipulation for panel width (no mouse simulation)
 
 param(
     [switch]$Once,       # Run Ctrl+Alt+V layout once (dual monitors bottom)
@@ -12,7 +13,6 @@ Add-Type @"
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
-using System.Threading;
 
 public class WinAPI {
     [DllImport("user32.dll")]
@@ -60,50 +60,6 @@ public class WinAPI {
     [DllImport("user32.dll")]
     public static extern IntPtr DispatchMessage(ref MSG lpMsg);
 
-    // Mouse control
-    [DllImport("user32.dll")]
-    public static extern bool SetCursorPos(int X, int Y);
-
-    [DllImport("user32.dll")]
-    public static extern bool GetCursorPos(out POINT lpPoint);
-
-    [DllImport("user32.dll")]
-    public static extern int GetSystemMetrics(int nIndex);
-
-    // SendInput with proper struct layout for unions
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
-
-    public const int SM_CXSCREEN = 0;
-    public const int SM_CYSCREEN = 1;
-    public const int SM_XVIRTUALSCREEN = 76;
-    public const int SM_YVIRTUALSCREEN = 77;
-    public const int SM_CXVIRTUALSCREEN = 78;
-    public const int SM_CYVIRTUALSCREEN = 79;
-
-    private const uint INPUT_MOUSE = 0;
-    private const uint MOUSEEVENTF_MOVE = 0x0001;
-    private const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
-    private const uint MOUSEEVENTF_LEFTUP = 0x0004;
-    private const uint MOUSEEVENTF_VIRTUALDESK = 0x4000;
-    private const uint MOUSEEVENTF_ABSOLUTE = 0x8000;
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct INPUT {
-        public uint type;
-        public MOUSEINPUT mi;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct MOUSEINPUT {
-        public int dx;
-        public int dy;
-        public uint mouseData;
-        public uint dwFlags;
-        public uint time;
-        public IntPtr dwExtraInfo;
-    }
-
     [StructLayout(LayoutKind.Sequential)]
     public struct MSG {
         public IntPtr hwnd;
@@ -121,84 +77,15 @@ public class WinAPI {
     }
 
     public const int WM_HOTKEY = 0x0312;
-
-    // Convert screen coordinates to virtual desktop normalized coordinates (0-65535)
-    private static void ToAbsolute(int x, int y, out int absX, out int absY) {
-        int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
-        int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-        int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-        int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-
-        absX = ((x - vx) * 65536) / vw;
-        absY = ((y - vy) * 65536) / vh;
-    }
-
-    public static void MouseClick(int x, int y) {
-        SetCursorPos(x, y);
-        Thread.Sleep(10);
-
-        int absX, absY;
-        ToAbsolute(x, y, out absX, out absY);
-
-        INPUT[] inputs = new INPUT[2];
-
-        inputs[0].type = INPUT_MOUSE;
-        inputs[0].mi.dx = absX;
-        inputs[0].mi.dy = absY;
-        inputs[0].mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN;
-
-        inputs[1].type = INPUT_MOUSE;
-        inputs[1].mi.dx = absX;
-        inputs[1].mi.dy = absY;
-        inputs[1].mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_LEFTUP;
-
-        SendInput(2, inputs, Marshal.SizeOf(typeof(INPUT)));
-    }
-
-    public static void MouseDrag(int fromX, int fromY, int toX, int toY) {
-        // Move to start position
-        SetCursorPos(fromX, fromY);
-        Thread.Sleep(50);
-
-        int absFromX, absFromY, absToX, absToY;
-        ToAbsolute(fromX, fromY, out absFromX, out absFromY);
-        ToAbsolute(toX, toY, out absToX, out absToY);
-
-        // Mouse down at start
-        INPUT downInput = new INPUT();
-        downInput.type = INPUT_MOUSE;
-        downInput.mi.dx = absFromX;
-        downInput.mi.dy = absFromY;
-        downInput.mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN;
-        SendInput(1, new INPUT[] { downInput }, Marshal.SizeOf(typeof(INPUT)));
-        Thread.Sleep(50);
-
-        // Move to end position (in steps for smoother drag)
-        int steps = 10;
-        for (int i = 1; i <= steps; i++) {
-            int curX = fromX + ((toX - fromX) * i / steps);
-            int curY = fromY + ((toY - fromY) * i / steps);
-            SetCursorPos(curX, curY);
-            Thread.Sleep(10);
-        }
-
-        // Final position
-        SetCursorPos(toX, toY);
-        Thread.Sleep(50);
-
-        // Mouse up at end
-        INPUT upInput = new INPUT();
-        upInput.type = INPUT_MOUSE;
-        upInput.mi.dx = absToX;
-        upInput.mi.dy = absToY;
-        upInput.mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_LEFTUP;
-        SendInput(1, new INPUT[] { upInput }, Marshal.SizeOf(typeof(INPUT)));
-    }
 }
 "@
 
 # Load Windows Forms for SendKeys
 Add-Type -AssemblyName System.Windows.Forms
+
+# Path to the Python helper script for setting panel width via SQLite
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$SetPanelWidthScript = Join-Path $ScriptDir "set_panel_width.py"
 
 # Window position settings for your monitors
 # DISPLAY6 (left):  X=0,    Y=1083, WorkingArea height=1032
@@ -208,8 +95,8 @@ $TargetY = 1083
 $TargetWidth = 3840
 $TargetHeight = 953
 
-# Panel divider target position (X coordinate where monitors split)
-$DividerTargetX = 1920
+# Panel width target (pixels) for dual monitor layout
+$PanelWidth = 1920
 
 # Top monitors layout (Ctrl+Alt+N) - spans DISPLAY2 + DISPLAY1 (top-left to top-middle)
 # DISPLAY2: X=-1360, Y=449, 1360x768
@@ -218,6 +105,9 @@ $SingleMonitorX = -1360       # Left edge of DISPLAY2
 $SingleMonitorY = 449         # Top of DISPLAY2
 $SingleMonitorWidth = 3280    # 1360 + 1920 (both monitors)
 $SingleMonitorHeight = 583    # From Y=449 to Y=1032 (DISPLAY1 working area bottom)
+
+# Panel width for single monitor layout (maximize auxiliary panel)
+$SinglePanelWidth = 3180      # Nearly full window width
 
 # Hotkey settings
 $MOD_CONTROL = 0x0002
@@ -260,6 +150,38 @@ function Find-VSCodeWindow {
     return $null
 }
 
+function Set-PanelWidthDB {
+    param(
+        [int]$Width
+    )
+
+    Write-Host "  Setting auxiliary bar width to ${Width}px via state.vscdb..." -ForegroundColor Cyan
+
+    if (-not (Test-Path $SetPanelWidthScript)) {
+        Write-Host "  ERROR: set_panel_width.py not found at $SetPanelWidthScript" -ForegroundColor Red
+        return $false
+    }
+
+    try {
+        $output = python $SetPanelWidthScript $Width 2>&1
+        $exitCode = $LASTEXITCODE
+
+        foreach ($line in $output) {
+            Write-Host "    $line" -ForegroundColor Gray
+        }
+
+        if ($exitCode -eq 0) {
+            Write-Host "  Panel width set successfully" -ForegroundColor Green
+            return $true
+        } else {
+            Write-Host "  WARNING: Failed to set panel width (exit code $exitCode)" -ForegroundColor Yellow
+            return $false
+        }
+    } catch {
+        Write-Host "  ERROR: Failed to run set_panel_width.py: $_" -ForegroundColor Red
+        return $false
+    }
+}
 
 function Open-SecondaryPanel {
     param(
@@ -267,60 +189,18 @@ function Open-SecondaryPanel {
         [switch]$SkipToggle  # Skip Ctrl+Alt+B if panel is already open
     )
 
-    # First ensure VS Code has focus
+    # Ensure VS Code has focus
     [WinAPI]::SetForegroundWindow($hwnd) | Out-Null
-    Start-Sleep -Milliseconds 50
-
-    # Click in the center of the VS Code window to ensure it has keyboard focus
-    $clickX = [int]($script:TargetX + ($script:TargetWidth / 2))
-    $clickY = [int]($script:TargetY + ($script:TargetHeight / 2))
-    [WinAPI]::MouseClick($clickX, $clickY)
-    Start-Sleep -Milliseconds 50
+    Start-Sleep -Milliseconds 100
 
     if (-not $SkipToggle) {
-        Write-Host "  Opening Claude Code panel (Ctrl+Alt+B)..." -ForegroundColor Cyan
-        # Use SendKeys to send Ctrl+Alt+B
-        # ^ = Ctrl, % = Alt, b = B key
+        Write-Host "  Opening secondary panel (Ctrl+Alt+B)..." -ForegroundColor Cyan
         [System.Windows.Forms.SendKeys]::SendWait("^%b")
-
-        # Wait for panel to open and render
         Start-Sleep -Milliseconds 300
         Write-Host "  Panel toggle sent" -ForegroundColor Green
     } else {
         Write-Host "  Skipping panel toggle (assuming already open)" -ForegroundColor Cyan
     }
-}
-
-function Move-PanelDivider {
-    param(
-        [int]$TargetX = 1920,
-        [int]$WindowX = 0,
-        [int]$WindowY = 1083,
-        [int]$WindowWidth = 3840,
-        [int]$WindowHeight = 953
-    )
-
-    Write-Host "  Dragging panel divider to X=$TargetX..." -ForegroundColor Cyan
-
-    # Save original cursor position
-    $originalPos = New-Object WinAPI+POINT
-    [WinAPI]::GetCursorPos([ref]$originalPos) | Out-Null
-
-    # Y position: middle of window, but skip title bar (~35px) and status bar (~25px)
-    $clickY = [int]($WindowY + 35 + (($WindowHeight - 60) / 2))
-
-    # The divider is 300px from right edge of window
-    $dividerX = $WindowX + $WindowWidth - 300
-
-    Write-Host "    Dragging from X=$dividerX to X=$TargetX, Y=$clickY" -ForegroundColor Gray
-
-    # Single drag from divider position to target using C# method
-    [WinAPI]::MouseDrag($dividerX, $clickY, $TargetX, $clickY)
-
-    # Restore cursor
-    [WinAPI]::SetCursorPos($originalPos.x, $originalPos.y) | Out-Null
-
-    Write-Host "  Panel divider drag complete" -ForegroundColor Green
 }
 
 function Duplicate-VSCodeWindow {
@@ -355,6 +235,9 @@ function Invoke-LayoutSnap {
     )
 
     Write-Host "`n[$(Get-Date -Format 'HH:mm:ss')] Snapping VS Code window..."
+
+    # Set panel width in state.vscdb before positioning
+    Set-PanelWidthDB -Width $PanelWidth | Out-Null
 
     $hwnd = Find-VSCodeWindow
 
@@ -391,17 +274,11 @@ function Invoke-LayoutSnap {
 
     if ($result) {
         Write-Host "  Repositioned to: X=$TargetX, Y=$TargetY, ${TargetWidth}x${TargetHeight}" -ForegroundColor Green
-        # Bring to front
         [WinAPI]::SetForegroundWindow($hwnd) | Out-Null
-
-        # Small delay for window to render
         Start-Sleep -Milliseconds 100
 
-        # Ensure VS Code has focus (skip Ctrl+Alt+B since panel is usually already open)
+        # Ensure secondary panel is visible
         Open-SecondaryPanel -hwnd $hwnd -SkipToggle
-
-        # Now drag the panel divider to the target position
-        Move-PanelDivider -TargetX $DividerTargetX -WindowX $TargetX -WindowY $TargetY -WindowWidth $TargetWidth -WindowHeight $TargetHeight
 
         return $true
     } else {
@@ -412,6 +289,9 @@ function Invoke-LayoutSnap {
 
 function Invoke-SingleMonitorLayout {
     Write-Host "`n[$(Get-Date -Format 'HH:mm:ss')] Snapping VS Code to top monitors (auxiliary panel full)..."
+
+    # Set panel width in state.vscdb for maximized auxiliary panel
+    Set-PanelWidthDB -Width $SinglePanelWidth | Out-Null
 
     # First run dual layout to set up panel correctly
     Write-Host "  Running dual layout first to set up panel..." -ForegroundColor Cyan
@@ -440,26 +320,8 @@ function Invoke-SingleMonitorLayout {
 
     if ($result) {
         Write-Host "  Repositioned to: X=$SingleMonitorX, Y=$SingleMonitorY, ${SingleMonitorWidth}x${SingleMonitorHeight}" -ForegroundColor Green
-        # Bring to front
         [WinAPI]::SetForegroundWindow($hwnd) | Out-Null
-
-        # Small delay for window to render
         Start-Sleep -Milliseconds 100
-
-        # Click to ensure focus
-        $clickX = [int]($SingleMonitorX + ($SingleMonitorWidth / 2))
-        $clickY = [int]($SingleMonitorY + ($SingleMonitorHeight / 2))
-        [WinAPI]::MouseClick($clickX, $clickY)
-        Start-Sleep -Milliseconds 50
-
-        # Drag panel divider to maximize auxiliary panel (panel is on right side)
-        # Start from right side of window, drag left to minimize editor
-        $dragY = [int]($SingleMonitorY + 35 + (($SingleMonitorHeight - 60) / 2))
-        $startX = $SingleMonitorX + $SingleMonitorWidth - 100  # Right side, inside panel
-        $endX = $SingleMonitorX + 100  # Left edge, minimal editor width
-
-        Write-Host "  Maximizing auxiliary panel (drag from X=$startX to X=$endX)..." -ForegroundColor Cyan
-        [WinAPI]::MouseDrag($startX, $dragY, $endX, $dragY)
 
         return $true
     } else {
@@ -491,8 +353,8 @@ Write-Host "============================================" -ForegroundColor Cyan
 Write-Host "  Ctrl+Alt+V - Dual monitor layout (bottom)" -ForegroundColor Yellow
 Write-Host "  Ctrl+Alt+N - Top monitors layout (panel full)" -ForegroundColor Yellow
 Write-Host ""
-Write-Host "  Dual:   ${TargetWidth}x${TargetHeight} at $TargetX,$TargetY"
-Write-Host "  Single: ${SingleMonitorWidth}x${SingleMonitorHeight} at $SingleMonitorX,$SingleMonitorY"
+Write-Host "  Dual:   ${TargetWidth}x${TargetHeight} at $TargetX,$TargetY (panel=${PanelWidth}px)"
+Write-Host "  Single: ${SingleMonitorWidth}x${SingleMonitorHeight} at $SingleMonitorX,$SingleMonitorY (panel=${SinglePanelWidth}px)"
 Write-Host ""
 Write-Host "  Press Ctrl+C to exit"
 Write-Host "============================================" -ForegroundColor Cyan
