@@ -567,14 +567,11 @@ function Set-AuxiliaryBarWidthCDP {
         $effectiveWidth = if ($ExpectedWindowWidth -gt 0) { $ExpectedWindowWidth } else { $sashInfo.windowWidth }
         $isLeft = $sashInfo.isLeft -eq $true
 
-        if ($isLeft) {
-            $targetSashX = $TargetWidth
-        } else {
-            $targetSashX = $effectiveWidth - $TargetWidth
-        }
+        # Same formula for both sides: sash goes to the monitor boundary
+        $targetSashX = $effectiveWidth - $TargetWidth
 
         $side = if ($isLeft) { "LEFT" } else { "RIGHT" }
-        Write-Host "    Sash at X=$currentSashX, target X=$targetSashX (panel=${TargetWidth}px, aux bar $side)" -ForegroundColor Gray
+        Write-Host "    Sash at X=$currentSashX, target X=$targetSashX (panel=${TargetWidth}px on ${effectiveWidth}px, aux bar $side)" -ForegroundColor Gray
 
         # Already close enough?
         if ([Math]::Abs($currentSashX - $targetSashX) -le 5) {
@@ -793,11 +790,8 @@ function Set-PanelWidth {
         }
     } catch {}
 
-    if ($auxIsLeft) {
-        $dividerTargetX = $WindowX + $Width
-    } else {
-        $dividerTargetX = $WindowX + $WindowWidth - $Width
-    }
+    # Same formula for both sides: sash at monitor boundary
+    $dividerTargetX = $WindowX + $WindowWidth - $Width
     Move-PanelDivider -TargetX $dividerTargetX -WindowX $WindowX -WindowY $WindowY `
         -WindowWidth $WindowWidth -WindowHeight $WindowHeight -AuxBarIsLeft $auxIsLeft
     return $true
