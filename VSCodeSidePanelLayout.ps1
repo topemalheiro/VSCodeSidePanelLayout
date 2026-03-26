@@ -208,8 +208,8 @@ $SingleMonitorY = 449         # Top of DISPLAY2
 $SingleMonitorWidth = 3280    # 1360 + 1920 (both monitors)
 $SingleMonitorHeight = 583    # From Y=449 to Y=1032 (DISPLAY1 working area bottom)
 
-# Panel width for single monitor layout (maximize auxiliary panel)
-$SinglePanelWidth = 3180
+# Panel width for single monitor layout (divider at monitor boundary: X=0 screen = 1360 viewport)
+$SinglePanelWidth = 1920
 
 # Hotkey settings
 $MOD_CONTROL = 0x0002
@@ -493,7 +493,8 @@ function Invoke-CDPSashDrag {
 function Set-AuxiliaryBarWidthCDP {
     param(
         [int]$TargetWidth,
-        [string]$WindowTitle = ""
+        [string]$WindowTitle = "",
+        [int]$ExpectedWindowWidth = 0
     )
 
     Write-Host "  Resizing auxiliary bar to ${TargetWidth}px via CDP..." -ForegroundColor Cyan
@@ -505,20 +506,26 @@ function Set-AuxiliaryBarWidthCDP {
     }
 
     try {
-        # Wait for window.innerWidth to stabilize after MoveWindow
-        $stableWidth = 0
+        # Wait for window.innerWidth to match expected width after MoveWindow
+        $expectedInner = if ($ExpectedWindowWidth -gt 0) { $ExpectedWindowWidth - 20 } else { 0 }
         $attempts = 0
-        while ($attempts -lt 10) {
+        while ($attempts -lt 15) {
             $sashInfo = Get-AuxiliaryBarSashPosition -Connection $conn
             if ($null -eq $sashInfo -or $sashInfo.error) {
                 Start-Sleep -Milliseconds 200
                 $attempts++
                 continue
             }
-            if ($sashInfo.windowWidth -eq $stableWidth) {
+            # If we know the expected width, wait until innerWidth is close
+            if ($expectedInner -gt 0) {
+                if ([Math]::Abs($sashInfo.windowWidth - $expectedInner) -lt 50) {
+                    break
+                }
+                Write-Host "    [DEBUG] Waiting for resize: innerWidth=$($sashInfo.windowWidth), expected~=$expectedInner" -ForegroundColor DarkGray
+            } else {
+                # No expected width — just use first successful reading
                 break
             }
-            $stableWidth = $sashInfo.windowWidth
             Start-Sleep -Milliseconds 200
             $attempts++
         }
@@ -665,7 +672,7 @@ function Set-PanelWidth {
     )
 
     # Try CDP first (no cursor movement)
-    $cdpResult = Set-AuxiliaryBarWidthCDP -TargetWidth $Width -WindowTitle $WindowTitle
+    $cdpResult = Set-AuxiliaryBarWidthCDP -TargetWidth $Width -WindowTitle $WindowTitle -ExpectedWindowWidth $WindowWidth
     if ($cdpResult) {
         return $true
     }
