@@ -456,7 +456,7 @@ function Invoke-CDPSashDrag {
         [int]$ToY
     )
 
-    # Mouse pressed at sash position
+    # Mouse pressed at sash
     Send-CDPMessage -Connection $Connection -Method "Input.dispatchMouseEvent" -Params @{
         type       = "mousePressed"
         x          = $FromX
@@ -465,22 +465,15 @@ function Invoke-CDPSashDrag {
         clickCount = 1
     } | Out-Null
 
-    Start-Sleep -Milliseconds 30
+    # Single instant move to target (no interpolation)
+    Send-CDPMessage -Connection $Connection -Method "Input.dispatchMouseEvent" -Params @{
+        type   = "mouseMoved"
+        x      = $ToX
+        y      = $FromY
+        button = "left"
+    } | Out-Null
 
-    # Interpolated mouse moves
-    $steps = 8
-    for ($i = 1; $i -le $steps; $i++) {
-        $curX = $FromX + [int](($ToX - $FromX) * $i / $steps)
-        Send-CDPMessage -Connection $Connection -Method "Input.dispatchMouseEvent" -Params @{
-            type   = "mouseMoved"
-            x      = $curX
-            y      = $FromY
-            button = "left"
-        } | Out-Null
-        Start-Sleep -Milliseconds 20
-    }
-
-    # Mouse released at target
+    # Release
     Send-CDPMessage -Connection $Connection -Method "Input.dispatchMouseEvent" -Params @{
         type       = "mouseReleased"
         x          = $ToX
@@ -506,58 +499,29 @@ function Set-AuxiliaryBarWidthCDP {
     }
 
     try {
-        # Wait for window.innerWidth to match expected width after MoveWindow
-        $expectedInner = if ($ExpectedWindowWidth -gt 0) { $ExpectedWindowWidth - 20 } else { 0 }
-        $attempts = 0
-        while ($attempts -lt 15) {
-            $sashInfo = Get-AuxiliaryBarSashPosition -Connection $conn
-            if ($null -eq $sashInfo -or $sashInfo.error) {
-                Start-Sleep -Milliseconds 200
-                $attempts++
-                continue
-            }
-            # If we know the expected width, wait until innerWidth is close
-            if ($expectedInner -gt 0) {
-                if ([Math]::Abs($sashInfo.windowWidth - $expectedInner) -lt 50) {
-                    break
-                }
-                Write-Host "    [DEBUG] Waiting for resize: innerWidth=$($sashInfo.windowWidth), expected~=$expectedInner" -ForegroundColor DarkGray
-            } else {
-                # No expected width — just use first successful reading
-                break
-            }
-            Start-Sleep -Milliseconds 200
-            $attempts++
-        }
+        # Single query to get current sash position
+        $sashInfo = Get-AuxiliaryBarSashPosition -Connection $conn
 
         if ($null -eq $sashInfo -or $sashInfo.error) {
-            $errMsg = if ($sashInfo.error) { $sashInfo.error } else { "no response" }
+            $errMsg = if ($sashInfo) { $sashInfo.error } else { "no response" }
             Write-Host "    Sash error: $errMsg" -ForegroundColor Yellow
             return $false
         }
 
-        $currentWidth = $sashInfo.auxBarWidth
-        $windowWidth = $sashInfo.windowWidth
-
-        Write-Host "    Window inner width: ${windowWidth}px, aux bar: ${currentWidth}px" -ForegroundColor Gray
-
-        # Debug: dump all diagnostic info from JS
-        if ($sashInfo.debug) {
-            foreach ($d in $sashInfo.debug) {
-                Write-Host "    [DEBUG] $d" -ForegroundColor DarkGray
-            }
-        }
-
-        # Already close enough?
-        if ([Math]::Abs($currentWidth - $TargetWidth) -le 5) {
-            Write-Host "    Already at ${currentWidth}px (target ${TargetWidth}px)" -ForegroundColor Green
-            return $true
-        }
-
-        # Calculate target sash X (aux bar extends from sash to right window edge)
-        $targetSashX = $windowWidth - $TargetWidth
         $currentSashX = $sashInfo.sashX
         $sashY = $sashInfo.sashY
+
+        # Use expected window width for target calculation (don't rely on potentially stale innerWidth)
+        $effectiveWidth = if ($ExpectedWindowWidth -gt 0) { $ExpectedWindowWidth } else { $sashInfo.windowWidth }
+        $targetSashX = $effectiveWidth - $TargetWidth
+
+        Write-Host "    Sash at X=$currentSashX, target X=$targetSashX (panel=${TargetWidth}px on ${effectiveWidth}px window)" -ForegroundColor Gray
+
+        # Already close enough?
+        if ([Math]::Abs($currentSashX - $targetSashX) -le 5) {
+            Write-Host "    Already at target position" -ForegroundColor Green
+            return $true
+        }
 
         Write-Host "    Dragging sash from X=$currentSashX to X=$targetSashX (Y=$sashY)" -ForegroundColor Gray
 
@@ -748,8 +712,7 @@ function Invoke-LayoutSnap {
         Write-Host "  Repositioned to: X=$TargetX, Y=$TargetY, ${TargetWidth}x${TargetHeight}" -ForegroundColor Green
         [WinAPI]::SetForegroundWindow($hwnd) | Out-Null
 
-        # Let VS Code render after window move before touching the sash
-        Start-Sleep -Milliseconds 500
+        Start-Sleep -Milliseconds 50
 
         $winTitle = $sb.ToString()
         Set-PanelWidth -Width $PanelWidth -WindowX $TargetX -WindowY $TargetY -WindowWidth $TargetWidth -WindowHeight $TargetHeight -WindowTitle $winTitle
