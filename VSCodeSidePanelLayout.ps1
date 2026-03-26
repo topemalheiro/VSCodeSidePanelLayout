@@ -439,8 +439,9 @@ function Get-AuxiliaryBarSashPosition {
 
     const auxRect = auxBar.getBoundingClientRect();
     const auxStyle = window.getComputedStyle(auxBar);
+    const isLeft = auxRect.left < window.innerWidth / 2;
     debug.push('auxBar: left=' + Math.round(auxRect.left) + ' top=' + Math.round(auxRect.top) + ' w=' + Math.round(auxRect.width) + ' h=' + Math.round(auxRect.height));
-    debug.push('auxBar display=' + auxStyle.display + ' visibility=' + auxStyle.visibility + ' position=' + auxStyle.position);
+    debug.push('auxBar side=' + (isLeft ? 'LEFT' : 'RIGHT'));
 
     if (auxRect.width === 0) return JSON.stringify({ error: 'auxiliary-bar-hidden', auxBarWidth: 0, debug: debug });
 
@@ -452,7 +453,10 @@ function Get-AuxiliaryBarSashPosition {
     let bestDist = Infinity;
     for (const s of vertSashes) {
         const r = s.getBoundingClientRect();
-        const dist = Math.abs(r.left + r.width / 2 - auxRect.left);
+        const sashCenter = r.left + r.width / 2;
+        const dist = isLeft
+            ? Math.abs(sashCenter - (auxRect.left + auxRect.width))
+            : Math.abs(sashCenter - auxRect.left);
         debug.push('  sash: x=' + Math.round(r.left) + ' w=' + Math.round(r.width) + ' h=' + Math.round(r.height) + ' dist=' + Math.round(dist));
         if (dist < bestDist) {
             bestDist = dist;
@@ -462,7 +466,7 @@ function Get-AuxiliaryBarSashPosition {
     if (!bestSash || bestDist > 20) return JSON.stringify({ error: 'no-sash-found', bestDist: bestDist, debug: debug });
 
     const sr = bestSash.getBoundingClientRect();
-    debug.push('bestSash: left=' + Math.round(sr.left) + ' top=' + Math.round(sr.top) + ' w=' + Math.round(sr.width) + ' h=' + Math.round(sr.height) + ' dist=' + Math.round(bestDist));
+    debug.push('bestSash: left=' + Math.round(sr.left) + ' w=' + Math.round(sr.width) + ' dist=' + Math.round(bestDist));
 
     return JSON.stringify({
         sashX: Math.round(sr.left + sr.width / 2),
@@ -472,6 +476,7 @@ function Get-AuxiliaryBarSashPosition {
         auxBarLeft: Math.round(auxRect.left),
         auxBarWidth: Math.round(auxRect.width),
         windowWidth: window.innerWidth,
+        isLeft: isLeft,
         debug: debug
     });
 })()
@@ -560,9 +565,16 @@ function Set-AuxiliaryBarWidthCDP {
 
         # Use expected window width for target calculation (don't rely on potentially stale innerWidth)
         $effectiveWidth = if ($ExpectedWindowWidth -gt 0) { $ExpectedWindowWidth } else { $sashInfo.windowWidth }
-        $targetSashX = $effectiveWidth - $TargetWidth
+        $isLeft = $sashInfo.isLeft -eq $true
 
-        Write-Host "    Sash at X=$currentSashX, target X=$targetSashX (panel=${TargetWidth}px on ${effectiveWidth}px window)" -ForegroundColor Gray
+        if ($isLeft) {
+            $targetSashX = $TargetWidth
+        } else {
+            $targetSashX = $effectiveWidth - $TargetWidth
+        }
+
+        $side = if ($isLeft) { "LEFT" } else { "RIGHT" }
+        Write-Host "    Sash at X=$currentSashX, target X=$targetSashX (panel=${TargetWidth}px, aux bar $side)" -ForegroundColor Gray
 
         # Already close enough?
         if ([Math]::Abs($currentSashX - $targetSashX) -le 5) {
@@ -667,7 +679,8 @@ function Move-PanelDivider {
         [int]$WindowX = 0,
         [int]$WindowY = 1083,
         [int]$WindowWidth = 3840,
-        [int]$WindowHeight = 953
+        [int]$WindowHeight = 953,
+        [bool]$AuxBarIsLeft = $false
     )
 
     Write-Host "  Dragging panel divider to X=$TargetX (mouse fallback)..." -ForegroundColor Cyan
@@ -676,7 +689,11 @@ function Move-PanelDivider {
     [WinAPI]::GetCursorPos([ref]$originalPos) | Out-Null
 
     $clickY = [int]($WindowY + 35 + (($WindowHeight - 60) / 2))
-    $dividerX = $WindowX + $WindowWidth - 300
+    if ($AuxBarIsLeft) {
+        $dividerX = $WindowX + 300
+    } else {
+        $dividerX = $WindowX + $WindowWidth - 300
+    }
 
     Write-Host "    Dragging from X=$dividerX to X=$TargetX, Y=$clickY" -ForegroundColor Gray
 
@@ -762,11 +779,27 @@ function Set-PanelWidth {
         }
     }
 
-    # Last resort: mouse drag
+    # Last resort: mouse drag (try to detect side via quick CDP query)
     Write-Host "  Using mouse drag..." -ForegroundColor Yellow
-    $dividerTargetX = $WindowX + $WindowWidth - $Width
+    $auxIsLeft = $false
+    try {
+        $quickConn = Connect-CDPWebSocket -WindowTitle $WindowTitle
+        if ($null -ne $quickConn) {
+            $quickInfo = Get-AuxiliaryBarSashPosition -Connection $quickConn
+            if ($null -ne $quickInfo -and $quickInfo.isLeft -eq $true) {
+                $auxIsLeft = $true
+            }
+            Disconnect-CDP -Connection $quickConn
+        }
+    } catch {}
+
+    if ($auxIsLeft) {
+        $dividerTargetX = $WindowX + $Width
+    } else {
+        $dividerTargetX = $WindowX + $WindowWidth - $Width
+    }
     Move-PanelDivider -TargetX $dividerTargetX -WindowX $WindowX -WindowY $WindowY `
-        -WindowWidth $WindowWidth -WindowHeight $WindowHeight
+        -WindowWidth $WindowWidth -WindowHeight $WindowHeight -AuxBarIsLeft $auxIsLeft
     return $true
 }
 
