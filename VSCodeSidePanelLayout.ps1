@@ -9,6 +9,49 @@ param(
     [switch]$Duplicate   # Duplicate window first, then snap
 )
 
+# ============================================================
+# Ensure VS Code always launches with --remote-debugging-port
+# Re-applies on every script start (survives VS Code updates)
+# ============================================================
+
+$cdpFlag = "--remote-debugging-port=9222"
+$codePath = "$env:LOCALAPPDATA\Programs\Microsoft VS Code\Code.exe"
+
+if (Test-Path $codePath) {
+    # Fix Start Menu shortcut
+    try {
+        $WshShell = New-Object -ComObject WScript.Shell
+        $lnkPath = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Visual Studio Code\Visual Studio Code.lnk"
+        if (Test-Path $lnkPath) {
+            $shortcut = $WshShell.CreateShortcut($lnkPath)
+            if ($shortcut.Arguments -notmatch "remote-debugging-port") {
+                $shortcut.Arguments = $cdpFlag
+                $shortcut.Save()
+            }
+        }
+    } catch {}
+
+    # Fix registry entries for file associations
+    $regKeys = @(
+        "HKCU:\Software\Classes\Applications\Code.exe\shell\open\command",
+        "HKCU:\Software\Classes\VSCodeSourceFile\shell\open\command",
+        "HKCU:\Software\Classes\vscode\shell\open\command"
+    )
+    foreach ($key in $regKeys) {
+        try {
+            if (Test-Path $key) {
+                $val = (Get-ItemProperty -Path $key).'(Default)'
+                if ($val -and $val -notmatch "remote-debugging-port") {
+                    $updated = $val -replace '(Code\.exe")', ('$1 "' + $cdpFlag + '"')
+                    Set-ItemProperty -Path $key -Name '(Default)' -Value $updated
+                }
+            }
+        } catch {}
+    }
+}
+
+# ============================================================
+
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
@@ -119,6 +162,10 @@ public class WinAPI {
     }
 
     public const int WM_HOTKEY = 0x0312;
+    public const int WM_CLOSE = 0x0010;
+
+    [DllImport("user32.dll")]
+    public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 
     private static void ToAbsolute(int x, int y, out int absX, out int absY) {
         int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
@@ -560,6 +607,56 @@ function Test-CDPAvailable {
     }
 }
 
+function Restart-VSCodeWithCDP {
+    param([IntPtr]$hwnd)
+
+    Write-Host "  Restarting this VS Code window with CDP flag..." -ForegroundColor Cyan
+
+    # Gracefully close ONLY this window (WM_CLOSE, not kill all processes)
+    [WinAPI]::PostMessage($hwnd, [WinAPI]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+    Start-Sleep -Milliseconds 2000
+
+    # Relaunch with CDP flag
+    $codePath = "$env:LOCALAPPDATA\Programs\Microsoft VS Code\Code.exe"
+    if (-not (Test-Path $codePath)) {
+        Write-Host "    Code.exe not found" -ForegroundColor Red
+        return $null
+    }
+
+    Start-Process -FilePath $codePath -ArgumentList "--remote-debugging-port=$CDPPort"
+
+    # Wait for new VS Code window
+    $waited = 0
+    $newHwnd = $null
+    while ($waited -lt 15000) {
+        $newHwnd = Find-VSCodeWindow
+        if ($null -ne $newHwnd -and $newHwnd -ne [IntPtr]::Zero -and $newHwnd -ne $hwnd) {
+            break
+        }
+        Start-Sleep -Milliseconds 500
+        $waited += 500
+    }
+
+    if ($null -eq $newHwnd -or $newHwnd -eq [IntPtr]::Zero) {
+        Write-Host "    Timeout waiting for VS Code window" -ForegroundColor Yellow
+        return $null
+    }
+
+    # Wait for CDP to become available
+    $waited = 0
+    while ($waited -lt 10000) {
+        if (Test-CDPAvailable) {
+            Write-Host "    CDP ready" -ForegroundColor Green
+            return $newHwnd
+        }
+        Start-Sleep -Milliseconds 500
+        $waited += 500
+    }
+
+    Write-Host "    Timeout waiting for CDP" -ForegroundColor Yellow
+    return $null
+}
+
 # ============================================================
 # WinAPI fallback functions (when CDP unavailable)
 # ============================================================
@@ -632,7 +729,8 @@ function Set-PanelWidth {
         [int]$WindowY,
         [int]$WindowWidth,
         [int]$WindowHeight,
-        [string]$WindowTitle = ""
+        [string]$WindowTitle = "",
+        [IntPtr]$WindowHandle = [IntPtr]::Zero
     )
 
     # Try CDP first (no cursor movement)
@@ -641,8 +739,31 @@ function Set-PanelWidth {
         return $true
     }
 
-    # CDP not available — use mouse drag immediately
-    Write-Host "  Using mouse drag..." -ForegroundColor Cyan
+    # CDP not available — gracefully restart this VS Code window with the flag
+    if ($WindowHandle -ne [IntPtr]::Zero) {
+        $newHwnd = Restart-VSCodeWithCDP -hwnd $WindowHandle
+        if ($null -ne $newHwnd) {
+            # Reposition the new window
+            [WinAPI]::ShowWindow($newHwnd, 9) | Out-Null
+            [WinAPI]::MoveWindow($newHwnd, $WindowX, $WindowY, $WindowWidth, $WindowHeight, $true) | Out-Null
+            [WinAPI]::SetForegroundWindow($newHwnd) | Out-Null
+            Start-Sleep -Milliseconds 50
+
+            # Get new window title
+            $titleLen = [WinAPI]::GetWindowTextLength($newHwnd)
+            $sb = New-Object System.Text.StringBuilder($titleLen + 1)
+            [WinAPI]::GetWindowText($newHwnd, $sb, $sb.Capacity) | Out-Null
+            $newTitle = $sb.ToString()
+
+            $cdpResult = Set-AuxiliaryBarWidthCDP -TargetWidth $Width -WindowTitle $newTitle -ExpectedWindowWidth $WindowWidth
+            if ($cdpResult) {
+                return $true
+            }
+        }
+    }
+
+    # Last resort: mouse drag
+    Write-Host "  Using mouse drag..." -ForegroundColor Yellow
     $dividerTargetX = $WindowX + $WindowWidth - $Width
     Move-PanelDivider -TargetX $dividerTargetX -WindowX $WindowX -WindowY $WindowY `
         -WindowWidth $WindowWidth -WindowHeight $WindowHeight
@@ -715,7 +836,7 @@ function Invoke-LayoutSnap {
         Start-Sleep -Milliseconds 50
 
         $winTitle = $sb.ToString()
-        Set-PanelWidth -Width $PanelWidth -WindowX $TargetX -WindowY $TargetY -WindowWidth $TargetWidth -WindowHeight $TargetHeight -WindowTitle $winTitle
+        Set-PanelWidth -Width $PanelWidth -WindowX $TargetX -WindowY $TargetY -WindowWidth $TargetWidth -WindowHeight $TargetHeight -WindowTitle $winTitle -WindowHandle $hwnd
 
         return $true
     } else {
@@ -751,7 +872,7 @@ function Invoke-SingleMonitorLayout {
         Start-Sleep -Milliseconds 500
 
         $winTitle = $sb.ToString()
-        Set-PanelWidth -Width $SinglePanelWidth -WindowX $SingleMonitorX -WindowY $SingleMonitorY -WindowWidth $SingleMonitorWidth -WindowHeight $SingleMonitorHeight -WindowTitle $winTitle
+        Set-PanelWidth -Width $SinglePanelWidth -WindowX $SingleMonitorX -WindowY $SingleMonitorY -WindowWidth $SingleMonitorWidth -WindowHeight $SingleMonitorHeight -WindowTitle $winTitle -WindowHandle $hwnd
 
         return $true
     } else {
