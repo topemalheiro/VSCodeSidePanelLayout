@@ -31,6 +31,30 @@ if (Test-Path $codePath) {
         }
     } catch {}
 
+    # Fix taskbar pinned shortcut
+    try {
+        $taskbarPath = "$env:APPDATA\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\Visual Studio Code.lnk"
+        if (Test-Path $taskbarPath) {
+            $shortcut = $WshShell.CreateShortcut($taskbarPath)
+            if ($shortcut.Arguments -notmatch "remote-debugging-port") {
+                $shortcut.Arguments = $cdpFlag
+                $shortcut.Save()
+            }
+        }
+    } catch {}
+
+    # Fix desktop shortcut
+    try {
+        $desktopPath = "$env:USERPROFILE\Desktop\Visual Studio Code.lnk"
+        if (Test-Path $desktopPath) {
+            $shortcut = $WshShell.CreateShortcut($desktopPath)
+            if ($shortcut.Arguments -notmatch "remote-debugging-port") {
+                $shortcut.Arguments = $cdpFlag
+                $shortcut.Save()
+            }
+        }
+    } catch {}
+
     # Fix registry entries for file associations
     $regKeys = @(
         "HKCU:\Software\Classes\Applications\Code.exe\shell\open\command",
