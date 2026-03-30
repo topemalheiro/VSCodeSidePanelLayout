@@ -11,10 +11,35 @@ param(
 
 # ============================================================
 # Ensure VS Code always launches with --remote-debugging-port
+# Uses IFEO (Image File Execution Options) to intercept ALL Code.exe launches
 # Re-applies on every script start (survives VS Code updates)
 # ============================================================
 
 $cdpFlag = "--remote-debugging-port=9222"
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# Compile and install IFEO wrapper (intercepts every Code.exe launch)
+$wrapperExe = Join-Path $ScriptDir "CodeCDPWrapper.exe"
+$wrapperSrc = Join-Path $ScriptDir "CodeCDPWrapper.cs"
+$cscPath = "$env:SystemRoot\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+
+if ((Test-Path $wrapperSrc) -and (Test-Path $cscPath)) {
+    # Recompile if source is newer than exe
+    if (-not (Test-Path $wrapperExe) -or (Get-Item $wrapperSrc).LastWriteTime -gt (Get-Item $wrapperExe).LastWriteTime) {
+        try {
+            & $cscPath -nologo -out:$wrapperExe -target:exe $wrapperSrc 2>$null
+        } catch {}
+    }
+
+    # Set IFEO registry key
+    if (Test-Path $wrapperExe) {
+        try {
+            $ifeoKey = "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\Code.exe"
+            New-Item -Path $ifeoKey -Force -ErrorAction SilentlyContinue | Out-Null
+            Set-ItemProperty -Path $ifeoKey -Name "Debugger" -Value ('"' + $wrapperExe + '"')
+        } catch {}
+    }
+}
 $codePath = "$env:LOCALAPPDATA\Programs\Microsoft VS Code\Code.exe"
 
 if (Test-Path $codePath) {
