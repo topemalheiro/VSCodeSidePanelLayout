@@ -1,7 +1,7 @@
 # VS Code Side Panel Layout Script
 # Hotkey: Ctrl+Alt+V (dual monitor), Ctrl+Alt+N (top monitors)
 # Snaps VS Code window and resizes auxiliary bar via CDP sash drag (no cursor movement)
-# Falls back to WinAPI mouse drag if CDP unavailable
+# Restarts VS Code with CDP flag if not already enabled
 
 param(
     [switch]$Once,       # Run Ctrl+Alt+V layout once (dual monitors bottom)
@@ -677,7 +677,7 @@ function Restart-VSCodeWithCDP {
 
     # Wait for CDP to become available
     $waited = 0
-    while ($waited -lt 10000) {
+    while ($waited -lt 45000) {
         if (Test-CDPAvailable) {
             Write-Host "    CDP ready" -ForegroundColor Green
             return $newHwnd
@@ -690,40 +690,7 @@ function Restart-VSCodeWithCDP {
     return $null
 }
 
-# ============================================================
-# WinAPI fallback functions (when CDP unavailable)
-# ============================================================
 
-function Move-PanelDivider {
-    param(
-        [int]$TargetX = 1920,
-        [int]$WindowX = 0,
-        [int]$WindowY = 1083,
-        [int]$WindowWidth = 3840,
-        [int]$WindowHeight = 953,
-        [bool]$AuxBarIsLeft = $false
-    )
-
-    Write-Host "  Dragging panel divider to X=$TargetX (mouse fallback)..." -ForegroundColor Cyan
-
-    $originalPos = New-Object WinAPI+POINT
-    [WinAPI]::GetCursorPos([ref]$originalPos) | Out-Null
-
-    $clickY = [int]($WindowY + 35 + (($WindowHeight - 60) / 2))
-    if ($AuxBarIsLeft) {
-        $dividerX = $WindowX + 300
-    } else {
-        $dividerX = $WindowX + $WindowWidth - 300
-    }
-
-    Write-Host "    Dragging from X=$dividerX to X=$TargetX, Y=$clickY" -ForegroundColor Gray
-
-    [WinAPI]::MouseDrag($dividerX, $clickY, $TargetX, $clickY)
-
-    [WinAPI]::SetCursorPos($originalPos.x, $originalPos.y) | Out-Null
-
-    Write-Host "  Panel divider drag complete" -ForegroundColor Green
-}
 
 # ============================================================
 # Core layout functions
@@ -800,25 +767,8 @@ function Set-PanelWidth {
         }
     }
 
-    # Last resort: mouse drag (try to detect side via quick CDP query)
-    Write-Host "  Using mouse drag..." -ForegroundColor Yellow
-    $auxIsLeft = $false
-    try {
-        $quickConn = Connect-CDPWebSocket -WindowTitle $WindowTitle
-        if ($null -ne $quickConn) {
-            $quickInfo = Get-AuxiliaryBarSashPosition -Connection $quickConn
-            if ($null -ne $quickInfo -and $quickInfo.isLeft -eq $true) {
-                $auxIsLeft = $true
-            }
-            Disconnect-CDP -Connection $quickConn
-        }
-    } catch {}
-
-    # Same formula for both sides: sash at monitor boundary
-    $dividerTargetX = $WindowX + $WindowWidth - $Width
-    Move-PanelDivider -TargetX $dividerTargetX -WindowX $WindowX -WindowY $WindowY `
-        -WindowWidth $WindowWidth -WindowHeight $WindowHeight -AuxBarIsLeft $auxIsLeft
-    return $true
+    Write-Host "  CDP failed - panel not resized" -ForegroundColor Red
+    return $false
 }
 
 function Duplicate-VSCodeWindow {
@@ -961,7 +911,7 @@ Write-Host "  Ctrl+Alt+N - Top monitors layout (panel full)" -ForegroundColor Ye
 Write-Host ""
 Write-Host "  Dual:   ${TargetWidth}x${TargetHeight} at $TargetX,$TargetY (panel=${PanelWidth}px)"
 Write-Host "  Single: ${SingleMonitorWidth}x${SingleMonitorHeight} at $SingleMonitorX,$SingleMonitorY (panel=${SinglePanelWidth}px)"
-$cdpStatus = if (Test-CDPAvailable) { "ACTIVE" } else { "not available (mouse drag)" }
+$cdpStatus = if (Test-CDPAvailable) { "ACTIVE" } else { "not active (will restart VS Code on first use)" }
 Write-Host "  CDP:    localhost:$CDPPort - $cdpStatus"
 Write-Host ""
 Write-Host "  Press Ctrl+C to exit"
