@@ -6,7 +6,11 @@
 param(
     [switch]$Once,       # Run Ctrl+Alt+V layout once (dual monitors bottom)
     [switch]$SingleOnce, # Run Ctrl+Alt+N layout once (top monitors)
-    [switch]$Duplicate   # Duplicate window first, then snap
+    [switch]$Duplicate,  # Duplicate window first, then snap
+    [string]$WindowTitle = "",  # Target a specific VS Code window by title substring
+    [switch]$StartupRepairOnly, # Re-apply CDP launch hooks and exit
+    [switch]$InstallStartup,    # Install startup repair entry
+    [switch]$UninstallStartup   # Remove startup repair entry
 )
 
 # ============================================================
@@ -17,86 +21,137 @@ param(
 
 $cdpFlag = "--remote-debugging-port=9222"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ScriptPath = $MyInvocation.MyCommand.Path
+$StartupRunKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+$StartupValueName = "VSCodeSidePanelLayoutCDPRepair"
+$PowerShellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
 
-# Compile and install IFEO wrapper (intercepts every Code.exe launch)
-$wrapperExe = Join-Path $ScriptDir "CodeCDPWrapper.exe"
-$wrapperSrc = Join-Path $ScriptDir "CodeCDPWrapper.cs"
-$cscPath = "$env:SystemRoot\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+function Install-CDPLaunchHooks {
+    param([switch]$Quiet)
 
-if ((Test-Path $wrapperSrc) -and (Test-Path $cscPath)) {
-    # Recompile if source is newer than exe
-    if (-not (Test-Path $wrapperExe) -or (Get-Item $wrapperSrc).LastWriteTime -gt (Get-Item $wrapperExe).LastWriteTime) {
-        try {
-            & $cscPath -nologo -out:$wrapperExe -target:exe $wrapperSrc 2>$null
-        } catch {}
+    # Compile and install IFEO wrapper (intercepts every Code.exe launch)
+    $wrapperExe = Join-Path $ScriptDir "CodeCDPWrapper.exe"
+    $wrapperSrc = Join-Path $ScriptDir "CodeCDPWrapper.cs"
+    $cscPath = "$env:SystemRoot\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+
+    if ((Test-Path $wrapperSrc) -and (Test-Path $cscPath)) {
+        # Recompile if source is newer than exe
+        if (-not (Test-Path $wrapperExe) -or (Get-Item $wrapperSrc).LastWriteTime -gt (Get-Item $wrapperExe).LastWriteTime) {
+            try {
+                & $cscPath -nologo -out:$wrapperExe -target:exe $wrapperSrc 2>$null
+            } catch {}
+        }
+
+        # Set IFEO registry key
+        if (Test-Path $wrapperExe) {
+            try {
+                $ifeoKey = "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\Code.exe"
+                New-Item -Path $ifeoKey -Force -ErrorAction SilentlyContinue | Out-Null
+                Set-ItemProperty -Path $ifeoKey -Name "Debugger" -Value ('"' + $wrapperExe + '"')
+            } catch {}
+        }
     }
 
-    # Set IFEO registry key
-    if (Test-Path $wrapperExe) {
+    $codePath = "$env:LOCALAPPDATA\Programs\Microsoft VS Code\Code.exe"
+
+    if (Test-Path $codePath) {
+        # Fix Start Menu shortcut
         try {
-            $ifeoKey = "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\Code.exe"
-            New-Item -Path $ifeoKey -Force -ErrorAction SilentlyContinue | Out-Null
-            Set-ItemProperty -Path $ifeoKey -Name "Debugger" -Value ('"' + $wrapperExe + '"')
-        } catch {}
-    }
-}
-$codePath = "$env:LOCALAPPDATA\Programs\Microsoft VS Code\Code.exe"
-
-if (Test-Path $codePath) {
-    # Fix Start Menu shortcut
-    try {
-        $WshShell = New-Object -ComObject WScript.Shell
-        $lnkPath = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Visual Studio Code\Visual Studio Code.lnk"
-        if (Test-Path $lnkPath) {
-            $shortcut = $WshShell.CreateShortcut($lnkPath)
-            if ($shortcut.Arguments -notmatch "remote-debugging-port") {
-                $shortcut.Arguments = $cdpFlag
-                $shortcut.Save()
-            }
-        }
-    } catch {}
-
-    # Fix taskbar pinned shortcut
-    try {
-        $taskbarPath = "$env:APPDATA\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\Visual Studio Code.lnk"
-        if (Test-Path $taskbarPath) {
-            $shortcut = $WshShell.CreateShortcut($taskbarPath)
-            if ($shortcut.Arguments -notmatch "remote-debugging-port") {
-                $shortcut.Arguments = $cdpFlag
-                $shortcut.Save()
-            }
-        }
-    } catch {}
-
-    # Fix desktop shortcut
-    try {
-        $desktopPath = "$env:USERPROFILE\Desktop\Visual Studio Code.lnk"
-        if (Test-Path $desktopPath) {
-            $shortcut = $WshShell.CreateShortcut($desktopPath)
-            if ($shortcut.Arguments -notmatch "remote-debugging-port") {
-                $shortcut.Arguments = $cdpFlag
-                $shortcut.Save()
-            }
-        }
-    } catch {}
-
-    # Fix registry entries for file associations
-    $regKeys = @(
-        "HKCU:\Software\Classes\Applications\Code.exe\shell\open\command",
-        "HKCU:\Software\Classes\VSCodeSourceFile\shell\open\command",
-        "HKCU:\Software\Classes\vscode\shell\open\command"
-    )
-    foreach ($key in $regKeys) {
-        try {
-            if (Test-Path $key) {
-                $val = (Get-ItemProperty -Path $key).'(Default)'
-                if ($val -and $val -notmatch "remote-debugging-port") {
-                    $updated = $val -replace '(Code\.exe")', ('$1 "' + $cdpFlag + '"')
-                    Set-ItemProperty -Path $key -Name '(Default)' -Value $updated
+            $WshShell = New-Object -ComObject WScript.Shell
+            $lnkPath = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Visual Studio Code\Visual Studio Code.lnk"
+            if (Test-Path $lnkPath) {
+                $shortcut = $WshShell.CreateShortcut($lnkPath)
+                if ($shortcut.Arguments -notmatch "remote-debugging-port") {
+                    $shortcut.Arguments = $cdpFlag
+                    $shortcut.Save()
                 }
             }
         } catch {}
+
+        # Fix taskbar pinned shortcut
+        try {
+            $taskbarPath = "$env:APPDATA\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\Visual Studio Code.lnk"
+            if (Test-Path $taskbarPath) {
+                $shortcut = $WshShell.CreateShortcut($taskbarPath)
+                if ($shortcut.Arguments -notmatch "remote-debugging-port") {
+                    $shortcut.Arguments = $cdpFlag
+                    $shortcut.Save()
+                }
+            }
+        } catch {}
+
+        # Fix desktop shortcut
+        try {
+            $desktopPath = "$env:USERPROFILE\Desktop\Visual Studio Code.lnk"
+            if (Test-Path $desktopPath) {
+                $shortcut = $WshShell.CreateShortcut($desktopPath)
+                if ($shortcut.Arguments -notmatch "remote-debugging-port") {
+                    $shortcut.Arguments = $cdpFlag
+                    $shortcut.Save()
+                }
+            }
+        } catch {}
+
+        # Fix registry entries for file associations
+        $regKeys = @(
+            "HKCU:\Software\Classes\Applications\Code.exe\shell\open\command",
+            "HKCU:\Software\Classes\VSCodeSourceFile\shell\open\command",
+            "HKCU:\Software\Classes\vscode\shell\open\command"
+        )
+        foreach ($key in $regKeys) {
+            try {
+                if (Test-Path $key) {
+                    $val = (Get-ItemProperty -Path $key).'(Default)'
+                    if ($val -and $val -notmatch "remote-debugging-port") {
+                        $updated = $val -replace '(Code\.exe")', ('$1 "' + $cdpFlag + '"')
+                        Set-ItemProperty -Path $key -Name '(Default)' -Value $updated
+                    }
+                }
+            } catch {}
+        }
     }
+
+    if (-not $Quiet) {
+        Write-Host "CDP launch hooks refreshed." -ForegroundColor Green
+    }
+}
+
+function Install-StartupRepair {
+    param([switch]$Quiet)
+
+    $startupCommand = ('"{0}" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{1}" -StartupRepairOnly' -f $PowerShellExe, $ScriptPath)
+    New-Item -Path $StartupRunKey -Force -ErrorAction SilentlyContinue | Out-Null
+    Set-ItemProperty -Path $StartupRunKey -Name $StartupValueName -Value $startupCommand
+
+    if (-not $Quiet) {
+        Write-Host "Startup repair installed." -ForegroundColor Green
+    }
+}
+
+function Uninstall-StartupRepair {
+    try {
+        Remove-ItemProperty -Path $StartupRunKey -Name $StartupValueName -ErrorAction Stop
+        Write-Host "Startup repair removed." -ForegroundColor Green
+    } catch {
+        Write-Host "Startup repair was not installed." -ForegroundColor Yellow
+    }
+}
+
+if ($UninstallStartup) {
+    Uninstall-StartupRepair
+    exit 0
+}
+
+Install-CDPLaunchHooks -Quiet
+Install-StartupRepair -Quiet
+
+if ($InstallStartup) {
+    Install-StartupRepair
+    exit 0
+}
+
+if ($StartupRepairOnly) {
+    exit 0
 }
 
 # ============================================================
@@ -665,8 +720,72 @@ function Test-CDPAvailable {
     }
 }
 
-function Restart-VSCodeWithCDP {
+function Get-VSCodeWindowProcessId {
     param([IntPtr]$hwnd)
+
+    if ($null -eq $hwnd -or $hwnd -eq [IntPtr]::Zero) {
+        return $null
+    }
+
+    $procId = [uint32]0
+    [WinAPI]::GetWindowThreadProcessId($hwnd, [ref]$procId) | Out-Null
+
+    if ($procId -eq 0) {
+        return $null
+    }
+
+    return [int]$procId
+}
+
+function Get-VSCodeWindowTitle {
+    param([IntPtr]$hwnd)
+
+    if ($null -eq $hwnd -or $hwnd -eq [IntPtr]::Zero) {
+        return ""
+    }
+
+    $titleLength = [WinAPI]::GetWindowTextLength($hwnd)
+    if ($titleLength -le 0) {
+        return ""
+    }
+
+    $sb = New-Object System.Text.StringBuilder($titleLength + 1)
+    [WinAPI]::GetWindowText($hwnd, $sb, $sb.Capacity) | Out-Null
+    return $sb.ToString()
+}
+
+function Get-ProcessCommandLine {
+    param([int]$ProcessId)
+
+    try {
+        $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop
+        return $proc.CommandLine
+    } catch {
+        return $null
+    }
+}
+
+function Test-VSCodeWindowHasCDPFlag {
+    param([IntPtr]$hwnd)
+
+    $procId = Get-VSCodeWindowProcessId -hwnd $hwnd
+    if ($null -eq $procId) {
+        return $false
+    }
+
+    $commandLine = Get-ProcessCommandLine -ProcessId $procId
+    if ([string]::IsNullOrWhiteSpace($commandLine)) {
+        return $false
+    }
+
+    return $commandLine -match '(^|\s)--remote-debugging-port(?:=|\s|$)'
+}
+
+function Restart-VSCodeWithCDP {
+    param(
+        [IntPtr]$hwnd,
+        [string]$ExpectedTitle = ""
+    )
 
     Write-Host "  Restarting this VS Code window with CDP flag..." -ForegroundColor Cyan
 
@@ -686,8 +805,13 @@ function Restart-VSCodeWithCDP {
     # Wait for new VS Code window
     $waited = 0
     $newHwnd = $null
+    $titleFilter = if ([string]::IsNullOrWhiteSpace($ExpectedTitle)) { Get-VSCodeWindowTitle -hwnd $hwnd } else { $ExpectedTitle }
     while ($waited -lt 15000) {
-        $newHwnd = Find-VSCodeWindow
+        if ($titleFilter) {
+            $newHwnd = Find-VSCodeWindow -TargetTitle $titleFilter
+        } else {
+            $newHwnd = Find-VSCodeWindow
+        }
         if ($null -ne $newHwnd -and $newHwnd -ne [IntPtr]::Zero -and $newHwnd -ne $hwnd) {
             break
         }
@@ -722,6 +846,30 @@ function Restart-VSCodeWithCDP {
 # ============================================================
 
 function Find-VSCodeWindow {
+    param(
+        [string]$TargetTitle = ""
+    )
+
+    # If a specific title filter is provided, skip foreground heuristic and search all windows
+    if ($TargetTitle -ne "") {
+        $vsCodeProcesses = Get-Process -Name "Code" -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero }
+        foreach ($proc in $vsCodeProcesses) {
+            if ($proc.MainWindowHandle -ne [IntPtr]::Zero) {
+                $titleLength = [WinAPI]::GetWindowTextLength($proc.MainWindowHandle)
+                if ($titleLength -gt 0) {
+                    $sb = New-Object System.Text.StringBuilder($titleLength + 1)
+                    [WinAPI]::GetWindowText($proc.MainWindowHandle, $sb, $sb.Capacity) | Out-Null
+                    $title = $sb.ToString()
+                    if ($title -like "*$TargetTitle*" -and $title -match "Visual Studio Code") {
+                        return $proc.MainWindowHandle
+                    }
+                }
+            }
+        }
+        return $null
+    }
+
+    # No filter — use original behavior: foreground first, then first match
     $foreground = [WinAPI]::GetForegroundWindow()
     $titleLength = [WinAPI]::GetWindowTextLength($foreground)
     if ($titleLength -gt 0) {
@@ -734,7 +882,6 @@ function Find-VSCodeWindow {
     }
 
     $vsCodeProcesses = Get-Process -Name "Code" -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero }
-
     foreach ($proc in $vsCodeProcesses) {
         if ($proc.MainWindowHandle -ne [IntPtr]::Zero) {
             $titleLength = [WinAPI]::GetWindowTextLength($proc.MainWindowHandle)
@@ -769,9 +916,22 @@ function Set-PanelWidth {
         return $true
     }
 
+    if ($WindowHandle -ne [IntPtr]::Zero -and (Test-VSCodeWindowHasCDPFlag -hwnd $WindowHandle)) {
+        Write-Host "  Target window already has CDP flag - retrying once without restart..." -ForegroundColor Yellow
+        Start-Sleep -Milliseconds 500
+
+        $retryResult = Set-AuxiliaryBarWidthCDP -TargetWidth $Width -WindowTitle $WindowTitle -ExpectedWindowWidth $WindowWidth
+        if ($retryResult) {
+            return $true
+        }
+
+        Write-Host "  CDP still failed, but restart skipped because this window already has the flag" -ForegroundColor Yellow
+        return $false
+    }
+
     # CDP not available — gracefully restart this VS Code window with the flag
     if ($WindowHandle -ne [IntPtr]::Zero) {
-        $newHwnd = Restart-VSCodeWithCDP -hwnd $WindowHandle
+        $newHwnd = Restart-VSCodeWithCDP -hwnd $WindowHandle -ExpectedTitle $WindowTitle
         if ($null -ne $newHwnd) {
             # Reposition the new window
             [WinAPI]::ShowWindow($newHwnd, 9) | Out-Null
@@ -780,10 +940,7 @@ function Set-PanelWidth {
             Start-Sleep -Milliseconds 50
 
             # Get new window title
-            $titleLen = [WinAPI]::GetWindowTextLength($newHwnd)
-            $sb = New-Object System.Text.StringBuilder($titleLen + 1)
-            [WinAPI]::GetWindowText($newHwnd, $sb, $sb.Capacity) | Out-Null
-            $newTitle = $sb.ToString()
+            $newTitle = Get-VSCodeWindowTitle -hwnd $newHwnd
 
             $cdpResult = Set-AuxiliaryBarWidthCDP -TargetWidth $Width -WindowTitle $newTitle -ExpectedWindowWidth $WindowWidth
             if ($cdpResult) {
@@ -824,11 +981,12 @@ function Invoke-LayoutSnap {
     )
 
     Write-Host "`n[$(Get-Date -Format 'HH:mm:ss')] Snapping VS Code window..."
+    Install-CDPLaunchHooks -Quiet
 
-    $hwnd = Find-VSCodeWindow
+    $hwnd = Find-VSCodeWindow -TargetTitle $WindowTitle
 
     if ($null -eq $hwnd -or $hwnd -eq [IntPtr]::Zero) {
-        Write-Host "  No VS Code window found!" -ForegroundColor Yellow
+        Write-Host "  No VS Code window found$(if ($WindowTitle) {" matching '$WindowTitle'"})!" -ForegroundColor Yellow
         return $false
     }
 
@@ -857,7 +1015,6 @@ function Invoke-LayoutSnap {
 
     if ($result) {
         Write-Host "  Repositioned to: X=$TargetX, Y=$TargetY, ${TargetWidth}x${TargetHeight}" -ForegroundColor Green
-        [WinAPI]::SetForegroundWindow($hwnd) | Out-Null
 
         Start-Sleep -Milliseconds 50
 
@@ -873,11 +1030,12 @@ function Invoke-LayoutSnap {
 
 function Invoke-SingleMonitorLayout {
     Write-Host "`n[$(Get-Date -Format 'HH:mm:ss')] Snapping VS Code to top monitors (auxiliary panel full)..."
+    Install-CDPLaunchHooks -Quiet
 
-    $hwnd = Find-VSCodeWindow
+    $hwnd = Find-VSCodeWindow -TargetTitle $WindowTitle
 
     if ($null -eq $hwnd -or $hwnd -eq [IntPtr]::Zero) {
-        Write-Host "  No VS Code window found!" -ForegroundColor Yellow
+        Write-Host "  No VS Code window found$(if ($WindowTitle) {" matching '$WindowTitle'"})!" -ForegroundColor Yellow
         return $false
     }
 
@@ -893,7 +1051,6 @@ function Invoke-SingleMonitorLayout {
 
     if ($result) {
         Write-Host "  Repositioned to: X=$SingleMonitorX, Y=$SingleMonitorY, ${SingleMonitorWidth}x${SingleMonitorHeight}" -ForegroundColor Green
-        [WinAPI]::SetForegroundWindow($hwnd) | Out-Null
 
         Start-Sleep -Milliseconds 500
 
