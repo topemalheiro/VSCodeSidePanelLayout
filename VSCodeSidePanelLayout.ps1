@@ -15,8 +15,9 @@ param(
 
 # ============================================================
 # Ensure VS Code always launches with --remote-debugging-port
-# Uses IFEO (Image File Execution Options) to intercept ALL Code.exe launches
-# Re-applies on every script start (survives VS Code updates)
+# Uses a hybrid wrapper install:
+# - swaps install-path Code.exe with a forwarding wrapper for first-launch coverage
+# - keeps stable external shims and shell overrides for update repair
 # ============================================================
 
 $cdpFlag = "--remote-debugging-port=9222"
@@ -25,89 +26,461 @@ $ScriptPath = $MyInvocation.MyCommand.Path
 $StartupRunKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
 $StartupValueName = "VSCodeSidePanelLayoutCDPRepair"
 $PowerShellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+$UserEnvironmentKey = "HKCU:\Environment"
+$UserPathBackupValueName = "VSCodeSidePanelLayoutPathBackup"
+$UserTempPath = Join-Path $env:LOCALAPPDATA "Temp"
+$CodeInstallDir = Join-Path $env:LOCALAPPDATA "Programs\Microsoft VS Code"
+$ManagedCodePath = Join-Path $CodeInstallDir "Code.exe"
+$ManagedRealCodePath = Join-Path $CodeInstallDir "Code.real.exe"
+$ManagedMarkerPath = Join-Path $CodeInstallDir "Code.cdp-wrapper.marker"
+$ShimDir = Join-Path $env:LOCALAPPDATA "CodeCDPShim"
+$ShimExePath = Join-Path $ShimDir "code.exe"
+$ShimCmdPath = Join-Path $ShimDir "code.cmd"
+$WrapperSrcPath = Join-Path $ScriptDir "CodeCDPWrapper.cs"
+$WrapperExePath = Join-Path $ScriptDir "CodeCDPWrapper.exe"
+$WrapperIconPath = Join-Path $ScriptDir "CodeCDPWrapper.ico"
+$IfeoKey = "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\Code.exe"
+
+function Test-FilesMatch {
+    param(
+        [string]$PathA,
+        [string]$PathB
+    )
+
+    if (-not (Test-Path -LiteralPath $PathA) -or -not (Test-Path -LiteralPath $PathB)) {
+        return $false
+    }
+
+    try {
+        $hashA = (Get-FileHash -LiteralPath $PathA -Algorithm SHA256).Hash
+        $hashB = (Get-FileHash -LiteralPath $PathB -Algorithm SHA256).Hash
+        return $hashA -eq $hashB
+    } catch {
+        return $false
+    }
+}
+
+function Test-IsVSCodeBinary {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $false
+    }
+
+    try {
+        $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($Path)
+        return (
+            $info.FileDescription -eq "Visual Studio Code" -or
+            $info.ProductName -eq "Visual Studio Code" -or
+            $info.OriginalFilename -eq "electron.exe"
+        )
+    } catch {
+        return $false
+    }
+}
+
+function Ensure-UsableTempEnvironment {
+    param([switch]$PersistUserVariables)
+
+    New-Item -ItemType Directory -Path $UserTempPath -Force -ErrorAction SilentlyContinue | Out-Null
+
+    $env:TEMP = $UserTempPath
+    $env:TMP = $UserTempPath
+
+    if ($PersistUserVariables) {
+        New-Item -Path $UserEnvironmentKey -Force -ErrorAction SilentlyContinue | Out-Null
+        $existingTemp = [Environment]::GetEnvironmentVariable("TEMP", "User")
+        $existingTmp = [Environment]::GetEnvironmentVariable("TMP", "User")
+
+        if ([string]::IsNullOrWhiteSpace($existingTemp) -or $existingTemp -ieq "C:\Windows\TEMP") {
+            New-ItemProperty -Path $UserEnvironmentKey -Name TEMP -Value $UserTempPath -PropertyType String -Force | Out-Null
+        }
+
+        if ([string]::IsNullOrWhiteSpace($existingTmp) -or $existingTmp -ieq "C:\Windows\TEMP") {
+            New-ItemProperty -Path $UserEnvironmentKey -Name TMP -Value $UserTempPath -PropertyType String -Force | Out-Null
+        }
+    }
+}
+
+function Ensure-CodeWrapperIcon {
+    $iconSourcePath = $null
+    if (Test-Path -LiteralPath $ManagedRealCodePath) {
+        $iconSourcePath = $ManagedRealCodePath
+    } elseif (Test-IsVSCodeBinary -Path $ManagedCodePath) {
+        $iconSourcePath = $ManagedCodePath
+    }
+
+    if ([string]::IsNullOrWhiteSpace($iconSourcePath)) {
+        return $null
+    }
+
+    $needsRefresh =
+        -not (Test-Path -LiteralPath $WrapperIconPath) -or
+        (Get-Item -LiteralPath $iconSourcePath).LastWriteTime -gt (Get-Item -LiteralPath $WrapperIconPath).LastWriteTime
+
+    if ($needsRefresh) {
+        Add-Type -AssemblyName System.Drawing
+        $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($iconSourcePath)
+        if ($null -ne $icon) {
+            $stream = [System.IO.File]::Create($WrapperIconPath)
+            try {
+                $icon.Save($stream)
+            } finally {
+                $stream.Dispose()
+                $icon.Dispose()
+            }
+        }
+    }
+
+    if (Test-Path -LiteralPath $WrapperIconPath) {
+        return $WrapperIconPath
+    }
+
+    return $null
+}
+
+function Ensure-CodeWrapperCompiled {
+    param([switch]$Quiet)
+
+    $cscPath = Join-Path $env:SystemRoot "Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+    $iconPath = Ensure-CodeWrapperIcon
+
+    if (-not (Test-Path -LiteralPath $WrapperSrcPath)) {
+        throw "Wrapper source not found: $WrapperSrcPath"
+    }
+
+    if (-not (Test-Path -LiteralPath $cscPath)) {
+        throw "C# compiler not found: $cscPath"
+    }
+
+    $needsCompile =
+        -not (Test-Path -LiteralPath $WrapperExePath) -or
+        (Get-Item -LiteralPath $WrapperSrcPath).LastWriteTime -gt (Get-Item -LiteralPath $WrapperExePath).LastWriteTime -or
+        ($iconPath -and (Test-Path -LiteralPath $iconPath) -and ((Get-Item -LiteralPath $iconPath).LastWriteTime -gt (Get-Item -LiteralPath $WrapperExePath).LastWriteTime))
+
+    if ($needsCompile) {
+        $compileArgs = @(
+            "-nologo",
+            "-target:winexe",
+            "-out:$WrapperExePath"
+        )
+
+        if ($iconPath) {
+            $compileArgs += "-win32icon:$iconPath"
+        }
+
+        $compileArgs += $WrapperSrcPath
+        & $cscPath @compileArgs 2>$null
+    }
+
+    if (-not (Test-Path -LiteralPath $WrapperExePath)) {
+        throw "Wrapper executable was not produced: $WrapperExePath"
+    }
+
+    return $WrapperExePath
+}
+
+function Install-CodeExeSwap {
+    param(
+        [string]$SourceWrapperExe,
+        [switch]$Quiet
+    )
+
+    if (-not (Test-Path -LiteralPath $ManagedCodePath) -and -not (Test-Path -LiteralPath $ManagedRealCodePath)) {
+        throw "VS Code install not found at $CodeInstallDir"
+    }
+
+    $managedCodeExists = Test-Path -LiteralPath $ManagedCodePath
+    $managedRealExists = Test-Path -LiteralPath $ManagedRealCodePath
+    $managedCodeIsCurrentWrapper = Test-FilesMatch -PathA $ManagedCodePath -PathB $SourceWrapperExe
+    $managedCodeIsVSCode = Test-IsVSCodeBinary -Path $ManagedCodePath
+
+    if (-not $managedRealExists) {
+        if (-not $managedCodeExists) {
+            throw "Code.exe missing at $ManagedCodePath"
+        }
+
+        if (-not $managedCodeIsVSCode) {
+            throw "Existing Code.exe is not the VS Code binary and Code.real.exe is missing."
+        }
+
+        Move-Item -LiteralPath $ManagedCodePath -Destination $ManagedRealCodePath -Force -ErrorAction Stop
+        Copy-Item -LiteralPath $SourceWrapperExe -Destination $ManagedCodePath -Force -ErrorAction Stop
+    } elseif (-not $managedCodeExists) {
+        Copy-Item -LiteralPath $SourceWrapperExe -Destination $ManagedCodePath -Force -ErrorAction Stop
+    } elseif (-not $managedCodeIsCurrentWrapper) {
+        if ($managedCodeIsVSCode) {
+            Copy-Item -LiteralPath $ManagedCodePath -Destination $ManagedRealCodePath -Force -ErrorAction Stop
+        }
+
+        Copy-Item -LiteralPath $SourceWrapperExe -Destination $ManagedCodePath -Force -ErrorAction Stop
+    }
+
+    Set-Content -LiteralPath $ManagedMarkerPath -Value "Managed by VSCodeSidePanelLayout" -Encoding Ascii
+}
+
+function Install-CodeShims {
+    param(
+        [string]$SourceWrapperExe,
+        [switch]$Quiet
+    )
+
+    $realCliCmd = Join-Path $CodeInstallDir "bin\code.cmd"
+    if (-not (Test-Path -LiteralPath $realCliCmd)) {
+        throw "VS Code CLI not found at $realCliCmd"
+    }
+
+    New-Item -ItemType Directory -Path $ShimDir -Force -ErrorAction Stop | Out-Null
+    Copy-Item -LiteralPath $SourceWrapperExe -Destination $ShimExePath -Force -ErrorAction Stop
+
+    $shimContent = @(
+        "@echo off",
+        "setlocal",
+        "call `"$realCliCmd`" --remote-debugging-port=9222 %*",
+        "set EXITCODE=%ERRORLEVEL%",
+        "endlocal & exit /b %EXITCODE%"
+    ) -join "`r`n"
+
+    Set-Content -LiteralPath $ShimCmdPath -Value $shimContent -Encoding Ascii
+}
+
+function Broadcast-EnvironmentChange {
+    Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class EnvironmentBroadcast {
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+    public static extern IntPtr SendMessageTimeout(
+        IntPtr hWnd,
+        uint Msg,
+        UIntPtr wParam,
+        string lParam,
+        uint fuFlags,
+        uint uTimeout,
+        out UIntPtr lpdwResult
+    );
+}
+"@ -ErrorAction SilentlyContinue
+
+    $result = [UIntPtr]::Zero
+    [void][EnvironmentBroadcast]::SendMessageTimeout(
+        [IntPtr]0xffff,
+        0x001A,
+        [UIntPtr]::Zero,
+        "Environment",
+        0x0002,
+        5000,
+        [ref]$result
+    )
+}
+
+function Get-DerivedUserPathSegments {
+    param([string]$PrefixPath)
+
+    $machineSegments = @(
+        [Environment]::GetEnvironmentVariable("Path", "Machine") -split ';' |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    $machineSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($segment in $machineSegments) {
+        [void]$machineSet.Add($segment.TrimEnd('\'))
+    }
+
+    $derivedSegments = @()
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($segment in ($env:Path -split ';')) {
+        if ([string]::IsNullOrWhiteSpace($segment)) {
+            continue
+        }
+
+        $normalizedSegment = $segment.TrimEnd('\')
+        if (
+            $normalizedSegment -ieq $PrefixPath.TrimEnd('\') -or
+            $normalizedSegment -ieq $CodeInstallDir.TrimEnd('\') -or
+            $normalizedSegment -like "$($env:USERPROFILE)\.codex\tmp\*"
+        ) {
+            continue
+        }
+
+        if ($machineSet.Contains($normalizedSegment) -or $seen.Contains($normalizedSegment)) {
+            continue
+        }
+
+        [void]$seen.Add($normalizedSegment)
+        $derivedSegments += $segment
+    }
+
+    return $derivedSegments
+}
+
+function Ensure-UserPathPrefix {
+    param(
+        [string]$PrefixPath,
+        [switch]$Quiet
+    )
+
+    New-Item -Path $UserEnvironmentKey -Force -ErrorAction SilentlyContinue | Out-Null
+    $environmentValues = Get-ItemProperty -Path $UserEnvironmentKey -ErrorAction SilentlyContinue
+    $existingUserPath = $environmentValues.Path
+    $backupUserPath = $environmentValues.$UserPathBackupValueName
+
+    if (
+        -not [string]::IsNullOrWhiteSpace($existingUserPath) -and
+        $existingUserPath.TrimEnd('\') -ine $PrefixPath.TrimEnd('\') -and
+        $existingUserPath -ne $backupUserPath
+    ) {
+        Set-ItemProperty -Path $UserEnvironmentKey -Name $UserPathBackupValueName -Value $existingUserPath
+        $backupUserPath = $existingUserPath
+    }
+
+    $baseUserPath = $existingUserPath
+    if ([string]::IsNullOrWhiteSpace($baseUserPath) -or $baseUserPath.TrimEnd('\') -ieq $PrefixPath.TrimEnd('\')) {
+        if (-not [string]::IsNullOrWhiteSpace($backupUserPath)) {
+            $baseUserPath = $backupUserPath
+        } else {
+            $baseUserPath = (Get-DerivedUserPathSegments -PrefixPath $PrefixPath) -join ';'
+            if (-not [string]::IsNullOrWhiteSpace($baseUserPath)) {
+                Set-ItemProperty -Path $UserEnvironmentKey -Name $UserPathBackupValueName -Value $baseUserPath
+            }
+        }
+    }
+
+    $segments = @()
+
+    foreach ($segment in ($baseUserPath -split ';')) {
+        if ([string]::IsNullOrWhiteSpace($segment)) {
+            continue
+        }
+
+        if ($segment.TrimEnd('\') -ieq $PrefixPath.TrimEnd('\')) {
+            continue
+        }
+
+        $segments += $segment
+    }
+
+    $updatedUserPath = ((@($PrefixPath) + $segments) -join ';')
+    Set-ItemProperty -Path $UserEnvironmentKey -Name Path -Value $updatedUserPath
+
+    $processSegments = @()
+    foreach ($segment in ($env:Path -split ';')) {
+        if ([string]::IsNullOrWhiteSpace($segment)) {
+            continue
+        }
+
+        if ($segment.TrimEnd('\') -ieq $PrefixPath.TrimEnd('\')) {
+            continue
+        }
+
+        $processSegments += $segment
+    }
+
+    $env:Path = ((@($PrefixPath) + $processSegments) -join ';')
+    Broadcast-EnvironmentChange
+}
+
+function Set-ShortcutTarget {
+    param(
+        [Parameter(Mandatory = $true)]
+        $WshShell,
+        [string]$ShortcutPath,
+        [string]$TargetPath,
+        [string]$Arguments,
+        [string]$IconTargetPath
+    )
+
+    if (-not (Test-Path -LiteralPath $ShortcutPath)) {
+        return
+    }
+
+    $shortcut = $WshShell.CreateShortcut($ShortcutPath)
+    $existingWorkingDirectory = $shortcut.WorkingDirectory
+
+    $shortcut.TargetPath = $TargetPath
+    $shortcut.Arguments = $Arguments
+    $shortcut.WorkingDirectory =
+        if ([string]::IsNullOrWhiteSpace($existingWorkingDirectory)) {
+            Split-Path -Parent $IconTargetPath
+        } else {
+            $existingWorkingDirectory
+        }
+    $shortcut.IconLocation = "$IconTargetPath,0"
+    $shortcut.Save()
+}
+
+function Set-RegistryCommand {
+    param(
+        [string]$KeyPath,
+        [string]$CommandValue
+    )
+
+    $item = New-Item -Path $KeyPath -Force -ErrorAction Stop
+    $item.SetValue("", $CommandValue)
+}
 
 function Install-CDPLaunchHooks {
     param([switch]$Quiet)
 
-    # Compile and install IFEO wrapper (intercepts every Code.exe launch)
-    $wrapperExe = Join-Path $ScriptDir "CodeCDPWrapper.exe"
-    $wrapperSrc = Join-Path $ScriptDir "CodeCDPWrapper.cs"
-    $cscPath = "$env:SystemRoot\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+    Ensure-UsableTempEnvironment -PersistUserVariables
+    $wrapperExe = Ensure-CodeWrapperCompiled -Quiet:$Quiet
+    $iconTargetPath = if (Test-Path -LiteralPath $ManagedRealCodePath) { $ManagedRealCodePath } else { $ManagedCodePath }
 
-    if ((Test-Path $wrapperSrc) -and (Test-Path $cscPath)) {
-        # Recompile if source is newer than exe
-        if (-not (Test-Path $wrapperExe) -or (Get-Item $wrapperSrc).LastWriteTime -gt (Get-Item $wrapperExe).LastWriteTime) {
-            try {
-                & $cscPath -nologo -out:$wrapperExe -target:exe $wrapperSrc 2>$null
-            } catch {}
-        }
+    try {
+        Remove-Item -LiteralPath $IfeoKey -Recurse -Force -ErrorAction SilentlyContinue
+    } catch {}
 
-        # Set IFEO registry key
-        if (Test-Path $wrapperExe) {
-            try {
-                $ifeoKey = "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\Code.exe"
-                New-Item -Path $ifeoKey -Force -ErrorAction SilentlyContinue | Out-Null
-                Set-ItemProperty -Path $ifeoKey -Name "Debugger" -Value ('"' + $wrapperExe + '"')
-            } catch {}
+    try {
+        Install-CodeExeSwap -SourceWrapperExe $wrapperExe -Quiet:$Quiet
+    } catch {
+        if (-not $Quiet) {
+            Write-Host "Code.exe swap skipped: $($_.Exception.Message)" -ForegroundColor Yellow
         }
     }
 
-    $codePath = "$env:LOCALAPPDATA\Programs\Microsoft VS Code\Code.exe"
+    try {
+        Install-CodeShims -SourceWrapperExe $wrapperExe -Quiet:$Quiet
+        Ensure-UserPathPrefix -PrefixPath $ShimDir -Quiet:$Quiet
+    } catch {
+        if (-not $Quiet) {
+            Write-Host "Shim repair failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
 
-    if (Test-Path $codePath) {
-        # Fix Start Menu shortcut
-        try {
-            $WshShell = New-Object -ComObject WScript.Shell
-            $lnkPath = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Visual Studio Code\Visual Studio Code.lnk"
-            if (Test-Path $lnkPath) {
-                $shortcut = $WshShell.CreateShortcut($lnkPath)
-                if ($shortcut.Arguments -notmatch "remote-debugging-port") {
-                    $shortcut.Arguments = $cdpFlag
-                    $shortcut.Save()
-                }
+    try {
+        $wshShell = New-Object -ComObject WScript.Shell
+        $shortcutTargetPath =
+            if (
+                (Test-Path -LiteralPath $ManagedRealCodePath) -and
+                (Test-FilesMatch -PathA $ManagedCodePath -PathB $wrapperExe)
+            ) {
+                $ManagedCodePath
+            } else {
+                $wrapperExe
             }
-        } catch {}
-
-        # Fix taskbar pinned shortcut
-        try {
-            $taskbarPath = "$env:APPDATA\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\Visual Studio Code.lnk"
-            if (Test-Path $taskbarPath) {
-                $shortcut = $WshShell.CreateShortcut($taskbarPath)
-                if ($shortcut.Arguments -notmatch "remote-debugging-port") {
-                    $shortcut.Arguments = $cdpFlag
-                    $shortcut.Save()
-                }
-            }
-        } catch {}
-
-        # Fix desktop shortcut
-        try {
-            $desktopPath = "$env:USERPROFILE\Desktop\Visual Studio Code.lnk"
-            if (Test-Path $desktopPath) {
-                $shortcut = $WshShell.CreateShortcut($desktopPath)
-                if ($shortcut.Arguments -notmatch "remote-debugging-port") {
-                    $shortcut.Arguments = $cdpFlag
-                    $shortcut.Save()
-                }
-            }
-        } catch {}
-
-        # Fix registry entries for file associations
-        $regKeys = @(
-            "HKCU:\Software\Classes\Applications\Code.exe\shell\open\command",
-            "HKCU:\Software\Classes\VSCodeSourceFile\shell\open\command",
-            "HKCU:\Software\Classes\vscode\shell\open\command"
+        $shortcutTargets = @(
+            "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Visual Studio Code\Visual Studio Code.lnk",
+            "$env:APPDATA\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\Visual Studio Code.lnk",
+            "$env:USERPROFILE\Desktop\Visual Studio Code.lnk"
         )
-        foreach ($key in $regKeys) {
-            try {
-                if (Test-Path $key) {
-                    $val = (Get-ItemProperty -Path $key).'(Default)'
-                    if ($val -and $val -notmatch "remote-debugging-port") {
-                        $updated = $val -replace '(Code\.exe")', ('$1 "' + $cdpFlag + '"')
-                        Set-ItemProperty -Path $key -Name '(Default)' -Value $updated
-                    }
-                }
-            } catch {}
+
+        foreach ($shortcutPath in $shortcutTargets) {
+            Set-ShortcutTarget -WshShell $wshShell -ShortcutPath $shortcutPath -TargetPath $shortcutTargetPath -Arguments "" -IconTargetPath $iconTargetPath
+        }
+    } catch {
+        if (-not $Quiet) {
+            Write-Host "Shortcut repair failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+
+    try {
+        Set-RegistryCommand -KeyPath "HKCU:\Software\Classes\Applications\Code.exe\shell\open\command" -CommandValue ('"{0}" "%1"' -f $wrapperExe)
+        Set-RegistryCommand -KeyPath "HKCU:\Software\Classes\VSCodeSourceFile\shell\open\command" -CommandValue ('"{0}" "%1"' -f $wrapperExe)
+        Set-RegistryCommand -KeyPath "HKCU:\Software\Classes\Directory\shell\VSCode\command" -CommandValue ('"{0}" "%V"' -f $wrapperExe)
+        Set-RegistryCommand -KeyPath "HKCU:\Software\Classes\Directory\Background\shell\VSCode\command" -CommandValue ('"{0}" "%V"' -f $wrapperExe)
+    } catch {
+        if (-not $Quiet) {
+            Write-Host "Shell command repair failed: $($_.Exception.Message)" -ForegroundColor Yellow
         }
     }
 
@@ -142,6 +515,7 @@ if ($UninstallStartup) {
     exit 0
 }
 
+Ensure-UsableTempEnvironment
 Install-CDPLaunchHooks -Quiet
 Install-StartupRepair -Quiet
 
@@ -981,7 +1355,6 @@ function Invoke-LayoutSnap {
     )
 
     Write-Host "`n[$(Get-Date -Format 'HH:mm:ss')] Snapping VS Code window..."
-    Install-CDPLaunchHooks -Quiet
 
     $hwnd = Find-VSCodeWindow -TargetTitle $WindowTitle
 
@@ -1030,7 +1403,6 @@ function Invoke-LayoutSnap {
 
 function Invoke-SingleMonitorLayout {
     Write-Host "`n[$(Get-Date -Format 'HH:mm:ss')] Snapping VS Code to top monitors (auxiliary panel full)..."
-    Install-CDPLaunchHooks -Quiet
 
     $hwnd = Find-VSCodeWindow -TargetTitle $WindowTitle
 

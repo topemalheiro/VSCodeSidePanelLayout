@@ -3,30 +3,18 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using Microsoft.Win32;
 
 class Program
 {
-    static bool IsCliLaunch(string[] originalArgs)
+    static readonly string DefaultCodeRoot = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "Programs",
+        "Microsoft VS Code"
+    );
+
+    static bool IsChildLaunch(string[] originalArgs)
     {
-        if (originalArgs.Length == 0)
-        {
-            return false;
-        }
-
-        string firstArg = originalArgs[0];
-        string fileName = Path.GetFileName(firstArg);
-        bool looksLikeCliScript =
-            fileName.Equals("cli.js", StringComparison.OrdinalIgnoreCase) ||
-            fileName.Equals("cli.mjs", StringComparison.OrdinalIgnoreCase);
-
-        bool runsAsNode = string.Equals(
-            Environment.GetEnvironmentVariable("ELECTRON_RUN_AS_NODE"),
-            "1",
-            StringComparison.Ordinal
-        );
-
-        return looksLikeCliScript && runsAsNode;
+        return originalArgs.Any(arg => arg.StartsWith("--type=", StringComparison.OrdinalIgnoreCase));
     }
 
     static string QuoteArgument(string arg)
@@ -44,57 +32,75 @@ class Program
         return "\"" + arg.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
     }
 
+    static string TryGetSiblingRealCodePath(string wrapperPath)
+    {
+        string wrapperDirectory = Path.GetDirectoryName(wrapperPath);
+        if (string.IsNullOrWhiteSpace(wrapperDirectory))
+        {
+            return null;
+        }
+
+        string siblingRealPath = Path.Combine(wrapperDirectory, "Code.real.exe");
+        return File.Exists(siblingRealPath) ? siblingRealPath : null;
+    }
+
+    static string ResolveTargetExe(string wrapperPath)
+    {
+        string siblingRealPath = TryGetSiblingRealCodePath(wrapperPath);
+        if (!string.IsNullOrWhiteSpace(siblingRealPath))
+        {
+            return siblingRealPath;
+        }
+
+        string managedRealPath = Path.Combine(DefaultCodeRoot, "Code.real.exe");
+        if (File.Exists(managedRealPath))
+        {
+            return managedRealPath;
+        }
+
+        return Path.Combine(DefaultCodeRoot, "Code.exe");
+    }
+
     static void Main(string[] args)
     {
-        if (args.Length == 0) return;
+        string wrapperPath = Process.GetCurrentProcess().MainModule.FileName;
+        string targetExe = ResolveTargetExe(wrapperPath);
 
-        string exe = args[0];
-        string[] originalArgs = args.Skip(1).ToArray();
-        string wrapperPath = System.Reflection.Assembly.GetExecutingAssembly().Location;
-        string ifeoKeyPath = @"Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\Code.exe";
+        if (
+            string.IsNullOrWhiteSpace(targetExe)
+            || !File.Exists(targetExe)
+            || string.Equals(
+                Path.GetFullPath(targetExe),
+                Path.GetFullPath(wrapperPath),
+                StringComparison.OrdinalIgnoreCase
+            )
+        )
+        {
+            return;
+        }
 
-        // Temporarily remove IFEO to prevent infinite recursion
-        try { Registry.CurrentUser.DeleteSubKey(ifeoKeyPath, false); } catch { }
-
+        string[] originalArgs = args;
         var launchArgs = new List<string>(originalArgs);
 
-        // Add CDP flag only for the main process (not child processes like --type=renderer)
-        bool isChild = originalArgs.Any(a => a.StartsWith("--type=", StringComparison.OrdinalIgnoreCase));
         bool hasCdpFlag = originalArgs.Any(
             a => a.IndexOf("remote-debugging-port", StringComparison.OrdinalIgnoreCase) >= 0
         );
 
-        if (!isChild && !hasCdpFlag)
+        if (!IsChildLaunch(originalArgs) && !hasCdpFlag)
         {
-            // `code.cmd` launches Code.exe in Node mode to run cli.js first.
-            // In that path the flag must sit after the script path so the CLI forwards it
-            // to the real GUI process on first open.
-            if (IsCliLaunch(originalArgs))
-            {
-                launchArgs.Insert(1, "--remote-debugging-port=9222");
-            }
-            else
-            {
-                launchArgs.Insert(0, "--remote-debugging-port=9222");
-            }
+            launchArgs.Insert(0, "--remote-debugging-port=9222");
         }
 
         string allArgs = string.Join(" ", launchArgs.Select(QuoteArgument));
 
-        // Launch real Code.exe
         try
         {
-            var psi = new ProcessStartInfo(exe, allArgs) { UseShellExecute = false };
+            var psi = new ProcessStartInfo(targetExe, allArgs)
+            {
+                UseShellExecute = false,
+                WorkingDirectory = Path.GetDirectoryName(targetExe) ?? DefaultCodeRoot,
+            };
             Process.Start(psi);
-        }
-        catch { }
-
-        // Re-add IFEO key
-        try
-        {
-            var key = Registry.CurrentUser.CreateSubKey(ifeoKeyPath);
-            key.SetValue("Debugger", "\"" + wrapperPath + "\"");
-            key.Close();
         }
         catch { }
     }
