@@ -32,7 +32,10 @@ $UserTempPath = Join-Path $env:LOCALAPPDATA "Temp"
 $CodeInstallDir = Join-Path $env:LOCALAPPDATA "Programs\Microsoft VS Code"
 $ManagedCodePath = Join-Path $CodeInstallDir "Code.exe"
 $ManagedRealCodePath = Join-Path $CodeInstallDir "Code.real.exe"
+$PendingRealCodePath = Join-Path $CodeInstallDir "Code.real.pending.exe"
 $ManagedMarkerPath = Join-Path $CodeInstallDir "Code.cdp-wrapper.marker"
+$RepairLogDir = Join-Path $env:LOCALAPPDATA "VSCodeSidePanelLayout"
+$RepairLogPath = Join-Path $RepairLogDir "repair.log"
 $ShimDir = Join-Path $env:LOCALAPPDATA "CodeCDPShim"
 $ShimExePath = Join-Path $ShimDir "code.exe"
 $ShimCmdPath = Join-Path $ShimDir "code.cmd"
@@ -40,6 +43,48 @@ $WrapperSrcPath = Join-Path $ScriptDir "CodeCDPWrapper.cs"
 $WrapperExePath = Join-Path $ScriptDir "CodeCDPWrapper.exe"
 $WrapperIconPath = Join-Path $ScriptDir "CodeCDPWrapper.ico"
 $IfeoKey = "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\Code.exe"
+$DevToolsActivePortPath = Join-Path $env:APPDATA "Code\DevToolsActivePort"
+
+function Write-RepairLog {
+    param(
+        [string]$Message,
+        [string]$Level = "INFO"
+    )
+
+    try {
+        New-Item -ItemType Directory -Path $RepairLogDir -Force -ErrorAction SilentlyContinue | Out-Null
+        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+        Add-Content -LiteralPath $RepairLogPath -Value "[$timestamp] [$Level] $Message" -Encoding UTF8
+    } catch {
+        # Logging should never block repair.
+    }
+}
+
+function Write-ManagedInstallMarker {
+    Set-Content -LiteralPath $ManagedMarkerPath -Value "Managed by VSCodeSidePanelLayout" -Encoding Ascii
+}
+
+function Promote-PendingRealCode {
+    if (-not (Test-Path -LiteralPath $PendingRealCodePath)) {
+        return $false
+    }
+
+    if ((Test-Path -LiteralPath $ManagedRealCodePath) -and (Test-FilesMatch -PathA $PendingRealCodePath -PathB $ManagedRealCodePath)) {
+        Remove-Item -LiteralPath $PendingRealCodePath -Force -ErrorAction SilentlyContinue
+        Write-RepairLog "Removed redundant staged Code.real pending update because it already matches Code.real.exe."
+        return $true
+    }
+
+    try {
+        Copy-Item -LiteralPath $PendingRealCodePath -Destination $ManagedRealCodePath -Force -ErrorAction Stop
+        Remove-Item -LiteralPath $PendingRealCodePath -Force -ErrorAction SilentlyContinue
+        Write-RepairLog "Promoted staged Code.real pending update into Code.real.exe."
+        return $true
+    } catch {
+        Write-RepairLog "Deferred staged Code.real pending update: $($_.Exception.Message)"
+        return $false
+    }
+}
 
 function Test-FilesMatch {
     param(
@@ -180,43 +225,118 @@ function Ensure-CodeWrapperCompiled {
     return $WrapperExePath
 }
 
+function Get-CodeInstallState {
+    param([string]$SourceWrapperExe)
+
+    $managedCodeExists = Test-Path -LiteralPath $ManagedCodePath
+    $managedRealExists = Test-Path -LiteralPath $ManagedRealCodePath
+    $markerExists = Test-Path -LiteralPath $ManagedMarkerPath
+
+    $managedCodeIsWrapper = $false
+    $managedCodeIsVSCode = $false
+    $managedRealIsVSCode = $false
+
+    if ($managedCodeExists) {
+        $managedCodeIsWrapper = Test-FilesMatch -PathA $ManagedCodePath -PathB $SourceWrapperExe
+        $managedCodeIsVSCode = Test-IsVSCodeBinary -Path $ManagedCodePath
+    }
+
+    if ($managedRealExists) {
+        $managedRealIsVSCode = Test-IsVSCodeBinary -Path $ManagedRealCodePath
+    }
+
+    $state = switch ($true) {
+        { $managedCodeExists -and $managedCodeIsWrapper -and $managedRealExists -and $managedRealIsVSCode -and $markerExists } { "managed"; break }
+        { $managedCodeExists -and $managedCodeIsWrapper -and $managedRealExists -and $managedRealIsVSCode -and -not $markerExists } { "managed-marker-missing"; break }
+        { -not $managedCodeExists -and $managedRealExists -and $managedRealIsVSCode } { "managed-code-missing"; break }
+        { $managedCodeExists -and $managedCodeIsVSCode -and $managedRealExists -and $managedRealIsVSCode } { "managed-overwritten"; break }
+        { $managedCodeExists -and $managedCodeIsVSCode -and -not $managedRealExists -and -not $markerExists } { "unmanaged"; break }
+        { $managedCodeExists -and $managedCodeIsWrapper -and -not $managedRealExists } { "wrapper-without-real"; break }
+        { -not $managedCodeExists -and -not $managedRealExists } { "missing-install"; break }
+        default { "unknown" }
+    }
+
+    return [pscustomobject]@{
+        State = $state
+        ManagedCodeExists = $managedCodeExists
+        ManagedRealExists = $managedRealExists
+        MarkerExists = $markerExists
+        ManagedCodeIsWrapper = $managedCodeIsWrapper
+        ManagedCodeIsVSCode = $managedCodeIsVSCode
+        ManagedRealIsVSCode = $managedRealIsVSCode
+    }
+}
+
 function Install-CodeExeSwap {
     param(
         [string]$SourceWrapperExe,
         [switch]$Quiet
     )
 
-    if (-not (Test-Path -LiteralPath $ManagedCodePath) -and -not (Test-Path -LiteralPath $ManagedRealCodePath)) {
-        throw "VS Code install not found at $CodeInstallDir"
+    Promote-PendingRealCode | Out-Null
+
+    $stateBefore = Get-CodeInstallState -SourceWrapperExe $SourceWrapperExe
+    Write-RepairLog "Install state before repair: $($stateBefore.State)"
+
+    switch ($stateBefore.State) {
+        "managed" {
+            Write-RepairLog "Managed state already healthy."
+        }
+        "managed-marker-missing" {
+            Write-ManagedInstallMarker
+            Write-RepairLog "Marker file restored for managed state."
+        }
+        "managed-code-missing" {
+            Copy-Item -LiteralPath $SourceWrapperExe -Destination $ManagedCodePath -Force -ErrorAction Stop
+            Write-ManagedInstallMarker
+            Write-RepairLog "Restored missing managed Code.exe wrapper."
+        }
+        "managed-overwritten" {
+            if (Test-FilesMatch -PathA $ManagedCodePath -PathB $ManagedRealCodePath) {
+                Remove-Item -LiteralPath $PendingRealCodePath -Force -ErrorAction SilentlyContinue
+                Write-RepairLog "Managed-overwritten payload already matches Code.real.exe; staging skipped."
+            } else {
+                Copy-Item -LiteralPath $ManagedCodePath -Destination $PendingRealCodePath -Force -ErrorAction Stop
+                try {
+                    Copy-Item -LiteralPath $ManagedCodePath -Destination $ManagedRealCodePath -Force -ErrorAction Stop
+                    Remove-Item -LiteralPath $PendingRealCodePath -Force -ErrorAction SilentlyContinue
+                    Write-RepairLog "Promoted overwritten Code.exe payload into Code.real.exe."
+                } catch {
+                    Write-RepairLog "Code.real.exe is in use; staged updated real binary at $PendingRealCodePath for later promotion."
+                }
+            }
+            Copy-Item -LiteralPath $SourceWrapperExe -Destination $ManagedCodePath -Force -ErrorAction Stop
+            Write-ManagedInstallMarker
+            Write-RepairLog "Recovered from update overwrite and restored managed wrapper."
+        }
+        "unmanaged" {
+            Move-Item -LiteralPath $ManagedCodePath -Destination $ManagedRealCodePath -Force -ErrorAction Stop
+            Copy-Item -LiteralPath $SourceWrapperExe -Destination $ManagedCodePath -Force -ErrorAction Stop
+            Write-ManagedInstallMarker
+            Write-RepairLog "Promoted unmanaged install into managed wrapper state."
+        }
+        "wrapper-without-real" {
+            Write-RepairLog "Wrapper exists without Code.real.exe; repair cannot continue safely." "ERROR"
+            throw "Managed wrapper exists without Code.real.exe. Manual recovery is required."
+        }
+        "missing-install" {
+            Write-RepairLog "VS Code install missing from expected root." "ERROR"
+            throw "VS Code install not found at $CodeInstallDir"
+        }
+        default {
+            Write-RepairLog "Unknown install state; refusing blind repair." "ERROR"
+            throw "Unrecognized VS Code install state. Manual recovery is required."
+        }
     }
 
-    $managedCodeExists = Test-Path -LiteralPath $ManagedCodePath
-    $managedRealExists = Test-Path -LiteralPath $ManagedRealCodePath
-    $managedCodeIsCurrentWrapper = Test-FilesMatch -PathA $ManagedCodePath -PathB $SourceWrapperExe
-    $managedCodeIsVSCode = Test-IsVSCodeBinary -Path $ManagedCodePath
+    $stateAfter = Get-CodeInstallState -SourceWrapperExe $SourceWrapperExe
+    Write-RepairLog "Install state after repair: $($stateAfter.State)"
 
-    if (-not $managedRealExists) {
-        if (-not $managedCodeExists) {
-            throw "Code.exe missing at $ManagedCodePath"
-        }
-
-        if (-not $managedCodeIsVSCode) {
-            throw "Existing Code.exe is not the VS Code binary and Code.real.exe is missing."
-        }
-
-        Move-Item -LiteralPath $ManagedCodePath -Destination $ManagedRealCodePath -Force -ErrorAction Stop
-        Copy-Item -LiteralPath $SourceWrapperExe -Destination $ManagedCodePath -Force -ErrorAction Stop
-    } elseif (-not $managedCodeExists) {
-        Copy-Item -LiteralPath $SourceWrapperExe -Destination $ManagedCodePath -Force -ErrorAction Stop
-    } elseif (-not $managedCodeIsCurrentWrapper) {
-        if ($managedCodeIsVSCode) {
-            Copy-Item -LiteralPath $ManagedCodePath -Destination $ManagedRealCodePath -Force -ErrorAction Stop
-        }
-
-        Copy-Item -LiteralPath $SourceWrapperExe -Destination $ManagedCodePath -Force -ErrorAction Stop
+    if ($stateAfter.State -ne "managed") {
+        throw "Managed install state was not restored. Current state: $($stateAfter.State)"
     }
 
-    Set-Content -LiteralPath $ManagedMarkerPath -Value "Managed by VSCodeSidePanelLayout" -Encoding Ascii
+    return $stateAfter
 }
 
 function Install-CodeShims {
@@ -424,15 +544,18 @@ function Install-CDPLaunchHooks {
 
     Ensure-UsableTempEnvironment -PersistUserVariables
     $wrapperExe = Ensure-CodeWrapperCompiled -Quiet:$Quiet
-    $iconTargetPath = if (Test-Path -LiteralPath $ManagedRealCodePath) { $ManagedRealCodePath } else { $ManagedCodePath }
+    Write-RepairLog "Starting CDP launch hook repair."
 
     try {
         Remove-Item -LiteralPath $IfeoKey -Recurse -Force -ErrorAction SilentlyContinue
+        Write-RepairLog "Removed stale IFEO key."
     } catch {}
 
+    $installState = $null
     try {
-        Install-CodeExeSwap -SourceWrapperExe $wrapperExe -Quiet:$Quiet
+        $installState = Install-CodeExeSwap -SourceWrapperExe $wrapperExe -Quiet:$Quiet
     } catch {
+        Write-RepairLog "Code.exe swap repair failed: $($_.Exception.Message)" "ERROR"
         if (-not $Quiet) {
             Write-Host "Code.exe swap skipped: $($_.Exception.Message)" -ForegroundColor Yellow
         }
@@ -441,7 +564,9 @@ function Install-CDPLaunchHooks {
     try {
         Install-CodeShims -SourceWrapperExe $wrapperExe -Quiet:$Quiet
         Ensure-UserPathPrefix -PrefixPath $ShimDir -Quiet:$Quiet
+        Write-RepairLog "Shim directory and PATH prefix refreshed."
     } catch {
+        Write-RepairLog "Shim repair failed: $($_.Exception.Message)" "ERROR"
         if (-not $Quiet) {
             Write-Host "Shim repair failed: $($_.Exception.Message)" -ForegroundColor Yellow
         }
@@ -449,15 +574,9 @@ function Install-CDPLaunchHooks {
 
     try {
         $wshShell = New-Object -ComObject WScript.Shell
-        $shortcutTargetPath =
-            if (
-                (Test-Path -LiteralPath $ManagedRealCodePath) -and
-                (Test-FilesMatch -PathA $ManagedCodePath -PathB $wrapperExe)
-            ) {
-                $ManagedCodePath
-            } else {
-                $wrapperExe
-            }
+        $effectiveState = if ($installState) { $installState } else { Get-CodeInstallState -SourceWrapperExe $wrapperExe }
+        $shortcutTargetPath = if ($effectiveState.State -eq "managed") { $ManagedCodePath } else { $wrapperExe }
+        $iconTargetPath = if (Test-Path -LiteralPath $ManagedRealCodePath) { $ManagedRealCodePath } else { $ManagedCodePath }
         $shortcutTargets = @(
             "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Visual Studio Code\Visual Studio Code.lnk",
             "$env:APPDATA\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\Visual Studio Code.lnk",
@@ -467,7 +586,9 @@ function Install-CDPLaunchHooks {
         foreach ($shortcutPath in $shortcutTargets) {
             Set-ShortcutTarget -WshShell $wshShell -ShortcutPath $shortcutPath -TargetPath $shortcutTargetPath -Arguments "" -IconTargetPath $iconTargetPath
         }
+        Write-RepairLog "Shortcut targets refreshed to $shortcutTargetPath."
     } catch {
+        Write-RepairLog "Shortcut repair failed: $($_.Exception.Message)" "ERROR"
         if (-not $Quiet) {
             Write-Host "Shortcut repair failed: $($_.Exception.Message)" -ForegroundColor Yellow
         }
@@ -478,11 +599,15 @@ function Install-CDPLaunchHooks {
         Set-RegistryCommand -KeyPath "HKCU:\Software\Classes\VSCodeSourceFile\shell\open\command" -CommandValue ('"{0}" "%1"' -f $wrapperExe)
         Set-RegistryCommand -KeyPath "HKCU:\Software\Classes\Directory\shell\VSCode\command" -CommandValue ('"{0}" "%V"' -f $wrapperExe)
         Set-RegistryCommand -KeyPath "HKCU:\Software\Classes\Directory\Background\shell\VSCode\command" -CommandValue ('"{0}" "%V"' -f $wrapperExe)
+        Write-RepairLog "Shell command overrides refreshed."
     } catch {
+        Write-RepairLog "Shell command repair failed: $($_.Exception.Message)" "ERROR"
         if (-not $Quiet) {
             Write-Host "Shell command repair failed: $($_.Exception.Message)" -ForegroundColor Yellow
         }
     }
+
+    Write-RepairLog "Completed CDP launch hook repair."
 
     if (-not $Quiet) {
         Write-Host "CDP launch hooks refreshed." -ForegroundColor Green
@@ -748,16 +873,75 @@ $HOTKEY_ID_N = 10000
 # CDP (Chrome DevTools Protocol) functions
 # ============================================================
 
+function Get-CDPEndpointInfo {
+    $port = $CDPPort
+    $source = "default"
+    $browserPath = ""
+    $fileExists = Test-Path -LiteralPath $DevToolsActivePortPath
+
+    if ($fileExists) {
+        try {
+            $lines = Get-Content -LiteralPath $DevToolsActivePortPath -ErrorAction Stop
+            if ($lines.Count -gt 0 -and $lines[0] -match '^\d+$') {
+                $port = [int]$lines[0]
+                $source = "DevToolsActivePort"
+            }
+
+            if ($lines.Count -gt 1) {
+                $browserPath = $lines[1]
+            }
+        } catch {
+            $source = "default"
+        }
+    }
+
+    return [pscustomobject]@{
+        Port = $port
+        Source = $source
+        FileExists = $fileExists
+        BrowserPath = $browserPath
+    }
+}
+
+function Get-CDPStatus {
+    $endpoint = Get-CDPEndpointInfo
+    $versionUri = "http://127.0.0.1:$($endpoint.Port)/json/version"
+
+    try {
+        $version = Invoke-RestMethod -Uri $versionUri -TimeoutSec 1 -ErrorAction Stop
+        return [pscustomobject]@{
+            Port = $endpoint.Port
+            Source = $endpoint.Source
+            FileExists = $endpoint.FileExists
+            BrowserPath = $endpoint.BrowserPath
+            EndpointReady = $true
+            ErrorMessage = ""
+            Browser = $version.Browser
+        }
+    } catch {
+        return [pscustomobject]@{
+            Port = $endpoint.Port
+            Source = $endpoint.Source
+            FileExists = $endpoint.FileExists
+            BrowserPath = $endpoint.BrowserPath
+            EndpointReady = $false
+            ErrorMessage = $_.Exception.Message
+            Browser = ""
+        }
+    }
+}
+
 function Connect-CDPWebSocket {
     param(
         [string]$WindowTitle = ""
     )
 
     try {
-        $targets = Invoke-RestMethod -Uri "http://localhost:$CDPPort/json" -TimeoutSec 3 -ErrorAction Stop
+        $endpoint = Get-CDPEndpointInfo
+        $targets = Invoke-RestMethod -Uri "http://127.0.0.1:$($endpoint.Port)/json" -TimeoutSec 3 -ErrorAction Stop
 
         # Debug: log all targets
-        Write-Host "    [DEBUG] CDP targets found: $($targets.Count)" -ForegroundColor DarkGray
+        Write-Host "    [DEBUG] CDP targets found: $($targets.Count) on port $($endpoint.Port) ($($endpoint.Source))" -ForegroundColor DarkGray
         foreach ($t in $targets) {
             $marker = ""
             if ($t.url -match "workbench") { $marker = " [WORKBENCH]" }
@@ -820,7 +1004,8 @@ function Connect-CDPWebSocket {
             MessageId = 1
         }
     } catch {
-        Write-Host "    CDP: Connection failed ($($_.Exception.Message))" -ForegroundColor Gray
+        $endpoint = Get-CDPEndpointInfo
+        Write-Host "    CDP: Connection failed on port $($endpoint.Port) ($($endpoint.Source)): $($_.Exception.Message)" -ForegroundColor Gray
         return $null
     }
 }
@@ -1086,12 +1271,7 @@ function Set-AuxiliaryBarWidthCDP {
 # ============================================================
 
 function Test-CDPAvailable {
-    try {
-        Invoke-RestMethod "http://localhost:$CDPPort/json" -TimeoutSec 1 -ErrorAction Stop | Out-Null
-        return $true
-    } catch {
-        return $false
-    }
+    return (Get-CDPStatus).EndpointReady
 }
 
 function Get-VSCodeWindowProcessId {
@@ -1155,6 +1335,22 @@ function Test-VSCodeWindowHasCDPFlag {
     return $commandLine -match '(^|\s)--remote-debugging-port(?:=|\s|$)'
 }
 
+function Get-VSCodeWindowCDPState {
+    param([IntPtr]$hwnd)
+
+    $status = Get-CDPStatus
+
+    return [pscustomobject]@{
+        HasFlag = Test-VSCodeWindowHasCDPFlag -hwnd $hwnd
+        EndpointReady = $status.EndpointReady
+        Port = $status.Port
+        Source = $status.Source
+        FileExists = $status.FileExists
+        BrowserPath = $status.BrowserPath
+        ErrorMessage = $status.ErrorMessage
+    }
+}
+
 function Restart-VSCodeWithCDP {
     param(
         [IntPtr]$hwnd,
@@ -1168,7 +1364,7 @@ function Restart-VSCodeWithCDP {
     Start-Sleep -Milliseconds 2000
 
     # Relaunch with CDP flag
-    $codePath = "$env:LOCALAPPDATA\Programs\Microsoft VS Code\Code.exe"
+    $codePath = if (Test-Path -LiteralPath $ManagedCodePath) { $ManagedCodePath } else { $ManagedRealCodePath }
     if (-not (Test-Path $codePath)) {
         Write-Host "    Code.exe not found" -ForegroundColor Red
         return $null
@@ -1226,7 +1422,7 @@ function Find-VSCodeWindow {
 
     # If a specific title filter is provided, skip foreground heuristic and search all windows
     if ($TargetTitle -ne "") {
-        $vsCodeProcesses = Get-Process -Name "Code" -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero }
+        $vsCodeProcesses = Get-Process -Name "Code","Code.real" -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero }
         foreach ($proc in $vsCodeProcesses) {
             if ($proc.MainWindowHandle -ne [IntPtr]::Zero) {
                 $titleLength = [WinAPI]::GetWindowTextLength($proc.MainWindowHandle)
@@ -1255,7 +1451,7 @@ function Find-VSCodeWindow {
         }
     }
 
-    $vsCodeProcesses = Get-Process -Name "Code" -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero }
+    $vsCodeProcesses = Get-Process -Name "Code","Code.real" -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero }
     foreach ($proc in $vsCodeProcesses) {
         if ($proc.MainWindowHandle -ne [IntPtr]::Zero) {
             $titleLength = [WinAPI]::GetWindowTextLength($proc.MainWindowHandle)
@@ -1290,17 +1486,25 @@ function Set-PanelWidth {
         return $true
     }
 
-    if ($WindowHandle -ne [IntPtr]::Zero -and (Test-VSCodeWindowHasCDPFlag -hwnd $WindowHandle)) {
-        Write-Host "  Target window already has CDP flag - retrying once without restart..." -ForegroundColor Yellow
-        Start-Sleep -Milliseconds 500
+    if ($WindowHandle -ne [IntPtr]::Zero) {
+        $windowCDPState = Get-VSCodeWindowCDPState -hwnd $WindowHandle
+        if ($windowCDPState.HasFlag -and $windowCDPState.EndpointReady) {
+            Write-Host "  Target window has CDP flag and reachable endpoint on port $($windowCDPState.Port) ($($windowCDPState.Source)) - retrying once without restart..." -ForegroundColor Yellow
+            Start-Sleep -Milliseconds 500
 
-        $retryResult = Set-AuxiliaryBarWidthCDP -TargetWidth $Width -WindowTitle $WindowTitle -ExpectedWindowWidth $WindowWidth
-        if ($retryResult) {
-            return $true
+            $retryResult = Set-AuxiliaryBarWidthCDP -TargetWidth $Width -WindowTitle $WindowTitle -ExpectedWindowWidth $WindowWidth
+            if ($retryResult) {
+                return $true
+            }
+
+            Write-Host "  CDP endpoint is reachable, but resize still failed; restart skipped because CDP is alive" -ForegroundColor Yellow
+            return $false
         }
 
-        Write-Host "  CDP still failed, but restart skipped because this window already has the flag" -ForegroundColor Yellow
-        return $false
+        if ($windowCDPState.HasFlag -and -not $windowCDPState.EndpointReady) {
+            $sourceText = if ($windowCDPState.FileExists) { "$($windowCDPState.Source)" } else { "default port" }
+            Write-Host "  Target window has CDP flag but endpoint is unavailable on port $($windowCDPState.Port) ($sourceText): $($windowCDPState.ErrorMessage)" -ForegroundColor Yellow
+        }
     }
 
     # CDP not available — gracefully restart this VS Code window with the flag
