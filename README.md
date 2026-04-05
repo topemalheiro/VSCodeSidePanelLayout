@@ -6,50 +6,30 @@ Falls back to WinAPI mouse drag if CDP is unavailable.
 
 ## VS Code Setup (Required for CDP)
 
-VS Code must be launched with the `--remote-debugging-port` flag for the cursor-free CDP resize to work.
+VS Code needs this in `argv.json` for the cursor-free CDP resize to work:
 
-### Option 1: Always launch with the flag (recommended)
+```json
+"remote-debugging-port": "9222"
+```
 
-Run this PowerShell script **once as administrator** to modify your VS Code shortcuts and registry entries:
+Open `Preferences: Configure Runtime Arguments` in VS Code, then make sure your `argv.json` contains that exact entry as a string.
 
-```powershell
-# Modify Start Menu shortcut
-$WshShell = New-Object -ComObject WScript.Shell
-$lnkPath = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Visual Studio Code\Visual Studio Code.lnk"
-$shortcut = $WshShell.CreateShortcut($lnkPath)
-$shortcut.Arguments = "--remote-debugging-port=9222"
-$shortcut.Save()
+On Windows, the file is usually:
 
-# Modify registry for file associations ("Open with Code", double-click, etc.)
-$codePath = "$env:LOCALAPPDATA\Programs\Microsoft VS Code\Code.exe"
-$entries = @(
-    "HKCU:\Software\Classes\vscode\shell\open\command",
-    "HKCU:\Software\Classes\Applications\Code.exe\shell\open\command",
-    "HKCU:\Software\Classes\VSCodeSourceFile\shell\open\command"
-)
-foreach ($key in $entries) {
-    if (Test-Path $key) {
-        $current = (Get-ItemProperty -Path $key).'(Default)'
-        if ($current -notmatch "remote-debugging-port") {
-            $updated = $current -replace '(Code\.exe")', '$1 "--remote-debugging-port=9222"'
-            Set-ItemProperty -Path $key -Name '(Default)' -Value $updated
-        }
-    }
+```text
+C:\Users\<you>\.vscode\argv.json
+```
+
+Example:
+
+```jsonc
+// NOTE: Changing this file requires a restart of VS Code.
+{
+  "remote-debugging-port": "9222"
 }
-Write-Host "Done. All VS Code launches will now include --remote-debugging-port=9222"
 ```
 
-> **Note:** VS Code updates may reset the Start Menu shortcut. Re-run the script above if CDP stops working after an update.
-
-### Option 2: Launch manually from the command line
-
-```
-code --remote-debugging-port=9222
-```
-
-### Option 3: Use the CDP shortcut
-
-Run `CreateShortcut.ps1` to create a "VS Code (CDP)" desktop shortcut.
+After changing `argv.json`, fully restart VS Code before using the layout script.
 
 ### Verify CDP is working
 
@@ -107,7 +87,7 @@ $SinglePanelWidth = 1920      # Auxiliary bar width (divider at monitor boundary
 | File | Purpose |
 |------|---------|
 | `VSCodeSidePanelLayout.ps1` | Main script (CDP sash drag + WinAPI fallback + hotkeys) |
-| `CreateShortcut.ps1` | Creates desktop shortcuts (layout script + VS Code CDP) |
+| `CreateShortcut.ps1` | Creates a desktop shortcut for the layout listener |
 | `set_panel_width.py` | Python helper to set auxiliary bar width in state.vscdb (pre-launch only) |
 
 ## How it works
