@@ -1,13 +1,15 @@
 # VS Code Side Panel Layout Script
 # Hotkey: Ctrl+Alt+V (dual monitor), Ctrl+Alt+N (top monitors)
 # Snaps VS Code window and resizes auxiliary bar via CDP sash drag (no cursor movement)
-# Restarts VS Code with CDP flag if not already enabled
+# Trusts the live CDP endpoint/targets and keeps current windows open if CDP is not ready yet
 
 param(
     [switch]$Once,       # Run Ctrl+Alt+V layout once (dual monitors bottom)
     [switch]$SingleOnce, # Run Ctrl+Alt+N layout once (top monitors)
     [switch]$Duplicate,  # Duplicate window first, then snap
     [string]$WindowTitle = "",  # Target a specific VS Code window by title substring
+    [switch]$RepairOnly,        # Internal: run fast-check-first repair and exit
+    [string]$RepairTriggerSource = "manual", # Internal repair trigger source
     [switch]$StartupRepairOnly, # Re-apply CDP launch hooks and exit
     [switch]$InstallStartup,    # Install startup repair entry
     [switch]$UninstallStartup   # Remove startup repair entry
@@ -20,7 +22,8 @@ param(
 # - keeps stable external shims and shell overrides for update repair
 # ============================================================
 
-$cdpFlag = "--remote-debugging-port=9222"
+$CDPPort = 9222
+$cdpFlag = "--remote-debugging-port=$CDPPort"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ScriptPath = $MyInvocation.MyCommand.Path
 $StartupRunKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
@@ -36,6 +39,7 @@ $PendingRealCodePath = Join-Path $CodeInstallDir "Code.real.pending.exe"
 $ManagedMarkerPath = Join-Path $CodeInstallDir "Code.cdp-wrapper.marker"
 $RepairLogDir = Join-Path $env:LOCALAPPDATA "VSCodeSidePanelLayout"
 $RepairLogPath = Join-Path $RepairLogDir "repair.log"
+$VSCodeArgvJsonPath = Join-Path $env:USERPROFILE ".vscode\argv.json"
 $ShimDir = Join-Path $env:LOCALAPPDATA "CodeCDPShim"
 $ShimExePath = Join-Path $ShimDir "code.exe"
 $ShimCmdPath = Join-Path $ShimDir "code.cmd"
@@ -44,6 +48,13 @@ $WrapperExePath = Join-Path $ScriptDir "CodeCDPWrapper.exe"
 $WrapperIconPath = Join-Path $ScriptDir "CodeCDPWrapper.ico"
 $IfeoKey = "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\Code.exe"
 $DevToolsActivePortPath = Join-Path $env:APPDATA "Code\DevToolsActivePort"
+$IntegrityPollIntervalMs = 2000
+$RepairDebounceMs = 5000
+$RepairMutexName = "Local\VSCodeSidePanelLayoutCDPRepair"
+$script:LastIntegrityPollAt = [DateTime]::MinValue
+$script:LastDriftRepairAt = [DateTime]::MinValue
+$script:LastDriftSignature = ""
+$script:LastRepairLockNoticeAt = [DateTime]::MinValue
 
 function Write-RepairLog {
     param(
@@ -60,8 +71,239 @@ function Write-RepairLog {
     }
 }
 
+function Get-VSCodeArgvJsonStatus {
+    $fileExists = Test-Path -LiteralPath $VSCodeArgvJsonPath
+    $rawValue = ""
+    $matchesPort = $false
+    $errorMessage = ""
+
+    if ($fileExists) {
+        try {
+            $content = Get-Content -LiteralPath $VSCodeArgvJsonPath -Raw -ErrorAction Stop
+            $match = [regex]::Match($content, '"remote-debugging-port"\s*:\s*"(?<port>[^"]+)"', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+            if ($match.Success) {
+                $rawValue = $match.Groups['port'].Value
+            }
+
+            $matchesPort = $rawValue -eq "$CDPPort"
+        } catch {
+            $errorMessage = $_.Exception.Message
+        }
+    }
+
+    return [pscustomobject]@{
+        Path = $VSCodeArgvJsonPath
+        FileExists = $fileExists
+        RawValue = $rawValue
+        MatchesPort = $matchesPort
+        ErrorMessage = $errorMessage
+    }
+}
+
+function Ensure-VSCodeArgvJsonPort {
+    $parentDir = Split-Path -Parent $VSCodeArgvJsonPath
+    New-Item -ItemType Directory -Path $parentDir -Force -ErrorAction SilentlyContinue | Out-Null
+    $fileAlreadyExists = Test-Path -LiteralPath $VSCodeArgvJsonPath
+
+    $rawContent =
+        if ($fileAlreadyExists) {
+            Get-Content -LiteralPath $VSCodeArgvJsonPath -Raw -ErrorAction Stop
+        } else {
+@"
+// This configuration file allows you to pass permanent command line arguments to VS Code.
+// Only a subset of arguments is currently supported to reduce the likelihood of breaking
+// the installation.
+//
+// PLEASE DO NOT CHANGE WITHOUT UNDERSTANDING THE IMPACT
+//
+// NOTE: Changing this file requires a restart of VS Code.
+{
+	"remote-debugging-port": "$CDPPort"
+}
+"@
+        }
+
+    $updatedContent = $rawContent
+    $desiredProperty = ('"remote-debugging-port": "{0}"' -f $CDPPort)
+    $existingPropertyPattern = '"remote-debugging-port"\s*:\s*(?:"[^"]*"|\d+)'
+
+    if ([regex]::IsMatch($updatedContent, $existingPropertyPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
+        $updatedContent = [regex]::Replace(
+            $updatedContent,
+            $existingPropertyPattern,
+            $desiredProperty,
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+        )
+    } else {
+        $newline = if ($updatedContent -match "`r`n") { "`r`n" } else { "`n" }
+        $contentWithoutLineComments = [regex]::Replace($updatedContent, '(?m)^\s*//.*$', '')
+        $hasAnyProperty = $contentWithoutLineComments -match '"[^"]+"\s*:'
+        $commaPrefix = if ($hasAnyProperty) { "," } else { "" }
+        $insertion = "$commaPrefix$newline`t$desiredProperty$newline"
+        $updatedContent = [regex]::Replace($updatedContent.TrimEnd(), '\}\s*$', "$insertion}", 1)
+    }
+
+    if (($updatedContent -ne $rawContent) -or -not $fileAlreadyExists) {
+        Set-Content -LiteralPath $VSCodeArgvJsonPath -Value $updatedContent -Encoding Ascii
+        return $true
+    }
+
+    return $false
+}
+
+function Invoke-VSCodeArgvJsonEnsure {
+    param(
+        [string]$TriggerSource = "manual",
+        [switch]$WriteConsoleNotice
+    )
+
+    try {
+        $updated = Ensure-VSCodeArgvJsonPort
+        $status = Get-VSCodeArgvJsonStatus
+
+        if ($updated) {
+            Write-RepairLog "Ensured argv.json remote-debugging-port for source '$TriggerSource'."
+            if ($WriteConsoleNotice) {
+                Write-Host "  Ensured argv.json remote-debugging-port=$CDPPort before evaluating CDP health..." -ForegroundColor DarkGray
+            }
+        }
+
+        return [pscustomobject]@{
+            Updated = $updated
+            Status = $status
+            ErrorMessage = ""
+        }
+    } catch {
+        $errorMessage = $_.Exception.Message
+        Write-RepairLog "Failed to ensure argv.json for source '$TriggerSource': $errorMessage" "WARN"
+
+        return [pscustomobject]@{
+            Updated = $false
+            Status = Get-VSCodeArgvJsonStatus
+            ErrorMessage = $errorMessage
+        }
+    }
+}
+
+function Format-RepairElapsed {
+    param([System.Diagnostics.Stopwatch]$Stopwatch)
+
+    if ($null -eq $Stopwatch) {
+        return "0 ms"
+    }
+
+    return "$($Stopwatch.ElapsedMilliseconds) ms"
+}
+
+function Test-CDPRepairInProgress {
+    $mutex = $null
+    $lockAcquired = $false
+
+    try {
+        $mutex = New-Object System.Threading.Mutex($false, $RepairMutexName)
+        try {
+            $lockAcquired = $mutex.WaitOne(0)
+        } catch [System.Threading.AbandonedMutexException] {
+            $lockAcquired = $true
+        }
+
+        if ($lockAcquired) {
+            $mutex.ReleaseMutex()
+            return $false
+        }
+
+        return $true
+    } finally {
+        if ($null -ne $mutex) {
+            $mutex.Dispose()
+        }
+    }
+}
+
+function Invoke-CDPLaunchRepairCore {
+    param(
+        [string]$TriggerSource,
+        [string[]]$DetectionReasons = @()
+    )
+
+    $mutex = $null
+    $lockAcquired = $false
+
+    try {
+        $mutex = New-Object System.Threading.Mutex($false, $RepairMutexName)
+        try {
+            $lockAcquired = $mutex.WaitOne(0)
+        } catch [System.Threading.AbandonedMutexException] {
+            $lockAcquired = $true
+        }
+
+        if (-not $lockAcquired) {
+            Write-RepairLog "Repair already in progress; source=$TriggerSource reused the in-flight repair."
+            return "locked"
+        }
+
+        Install-CDPLaunchHooks -Quiet -TriggerSource $TriggerSource -DetectionReasons $DetectionReasons
+        return "completed"
+    } catch {
+        Write-RepairLog "Repair execution failed for source '$TriggerSource': $($_.Exception.Message)" "ERROR"
+        return "failed"
+    } finally {
+        if ($lockAcquired -and $null -ne $mutex) {
+            try {
+                $mutex.ReleaseMutex()
+            } catch {
+                # Ignore release issues during shutdown.
+            }
+        }
+
+        if ($null -ne $mutex) {
+            $mutex.Dispose()
+        }
+    }
+}
+
+function Start-CDPBackgroundRepair {
+    param([string]$TriggerSource)
+
+    try {
+        $process = Start-Process -FilePath $PowerShellExe -ArgumentList @(
+            "-NoProfile",
+            "-WindowStyle", "Hidden",
+            "-ExecutionPolicy", "Bypass",
+            "-File", $ScriptPath,
+            "-RepairOnly",
+            "-RepairTriggerSource", $TriggerSource
+        ) -WindowStyle Hidden -PassThru
+
+        Write-RepairLog "Queued background repair process $($process.Id) for trigger '$TriggerSource'."
+        return $true
+    } catch {
+        Write-RepairLog "Failed to queue background repair for '$TriggerSource': $($_.Exception.Message)" "ERROR"
+        return $false
+    }
+}
+
 function Write-ManagedInstallMarker {
     Set-Content -LiteralPath $ManagedMarkerPath -Value "Managed by VSCodeSidePanelLayout" -Encoding Ascii
+}
+
+function Get-ManagedShortcutPaths {
+    return @(
+        "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Visual Studio Code\Visual Studio Code.lnk",
+        "$env:APPDATA\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\Visual Studio Code.lnk",
+        "$env:USERPROFILE\Desktop\Visual Studio Code.lnk"
+    )
+}
+
+function Get-ExpectedShellCommandDefinitions {
+    param([string]$WrapperExe)
+
+    return @(
+        [pscustomobject]@{ KeyPath = "HKCU:\Software\Classes\Applications\Code.exe\shell\open\command"; CommandValue = ('"{0}" "%1"' -f $WrapperExe) },
+        [pscustomobject]@{ KeyPath = "HKCU:\Software\Classes\VSCodeSourceFile\shell\open\command"; CommandValue = ('"{0}" "%1"' -f $WrapperExe) },
+        [pscustomobject]@{ KeyPath = "HKCU:\Software\Classes\Directory\shell\VSCode\command"; CommandValue = ('"{0}" "%V"' -f $WrapperExe) },
+        [pscustomobject]@{ KeyPath = "HKCU:\Software\Classes\Directory\Background\shell\VSCode\command"; CommandValue = ('"{0}" "%V"' -f $WrapperExe) }
+    )
 }
 
 function Promote-PendingRealCode {
@@ -539,12 +781,169 @@ function Set-RegistryCommand {
     $item.SetValue("", $CommandValue)
 }
 
+function Get-CDPLaunchSurfaceStatus {
+    param([string]$SourceWrapperExe = $WrapperExePath)
+
+    $reasons = New-Object 'System.Collections.Generic.List[string]'
+    $shortcutIssues = New-Object 'System.Collections.Generic.List[string]'
+    $shellIssues = New-Object 'System.Collections.Generic.List[string]'
+    $shimIssues = New-Object 'System.Collections.Generic.List[string]'
+    $argvIssues = New-Object 'System.Collections.Generic.List[string]'
+
+    $wrapperExists = Test-Path -LiteralPath $SourceWrapperExe
+    if (-not $wrapperExists) {
+        $reasons.Add("wrapper-missing")
+    }
+
+    $installState =
+        if ($wrapperExists) {
+            Get-CodeInstallState -SourceWrapperExe $SourceWrapperExe
+        } else {
+            [pscustomobject]@{
+                State = "wrapper-missing"
+                ManagedCodeExists = Test-Path -LiteralPath $ManagedCodePath
+                ManagedRealExists = Test-Path -LiteralPath $ManagedRealCodePath
+                MarkerExists = Test-Path -LiteralPath $ManagedMarkerPath
+                ManagedCodeIsWrapper = $false
+                ManagedCodeIsVSCode = $false
+                ManagedRealIsVSCode = $false
+            }
+        }
+
+    if ($installState.State -ne "managed") {
+        $reasons.Add($installState.State)
+    }
+
+    if (-not (Test-Path -LiteralPath $ShimExePath)) {
+        $shimIssues.Add("shim-exe-missing")
+        $reasons.Add("shim-exe-missing")
+    } elseif ($wrapperExists -and -not (Test-FilesMatch -PathA $ShimExePath -PathB $SourceWrapperExe)) {
+        $shimIssues.Add("shim-exe-mismatch")
+        $reasons.Add("shim-exe-mismatch")
+    }
+
+    $realCliCmd = Join-Path $CodeInstallDir "bin\code.cmd"
+    if (-not (Test-Path -LiteralPath $ShimCmdPath)) {
+        $shimIssues.Add("shim-cmd-missing")
+        $reasons.Add("shim-cmd-missing")
+    } else {
+        $shimCmdContent = Get-Content -LiteralPath $ShimCmdPath -Raw -ErrorAction SilentlyContinue
+        $expectedShimCall = ('call "{0}" --remote-debugging-port=9222 %*' -f $realCliCmd)
+        if ([string]::IsNullOrWhiteSpace($shimCmdContent) -or $shimCmdContent -notlike "*$expectedShimCall*") {
+            $shimIssues.Add("shim-cmd-mismatch")
+            $reasons.Add("shim-cmd-mismatch")
+        }
+    }
+
+    $codeSource = ""
+    try {
+        $codeCmdInfo = Get-Command code -ErrorAction SilentlyContinue
+        if ($codeCmdInfo) {
+            $codeSource = $codeCmdInfo.Source
+            if ($codeSource -notlike "$ShimDir*") {
+                $reasons.Add("code-path-drift")
+            }
+        } else {
+            $reasons.Add("code-command-missing")
+        }
+    } catch {
+        $reasons.Add("code-command-unresolved")
+    }
+
+    $argvStatus = Get-VSCodeArgvJsonStatus
+    if (-not $argvStatus.FileExists) {
+        $argvIssues.Add("argv-json-missing")
+        $reasons.Add("argv-json-missing")
+    } elseif ($argvStatus.MatchesPort) {
+        # Healthy argv.json state.
+    } elseif (-not [string]::IsNullOrWhiteSpace($argvStatus.RawValue)) {
+        $argvIssues.Add("argv-cdp-mismatch:$($argvStatus.RawValue)")
+        $reasons.Add("argv-cdp-mismatch")
+    } elseif (-not [string]::IsNullOrWhiteSpace($argvStatus.ErrorMessage)) {
+        $argvIssues.Add("argv-read-failed:$($argvStatus.ErrorMessage)")
+        $reasons.Add("argv-read-failed")
+    } else {
+        $argvIssues.Add("argv-cdp-missing")
+        $reasons.Add("argv-cdp-missing")
+    }
+
+    $expectedShortcutTarget =
+        if ($installState.State -eq "managed") {
+            $ManagedCodePath
+        } else {
+            $SourceWrapperExe
+        }
+
+    try {
+        $wshShell = New-Object -ComObject WScript.Shell
+        foreach ($shortcutPath in (Get-ManagedShortcutPaths)) {
+            if (-not (Test-Path -LiteralPath $shortcutPath)) {
+                continue
+            }
+
+            $shortcut = $wshShell.CreateShortcut($shortcutPath)
+            $targetPath = $shortcut.TargetPath
+            $arguments = $shortcut.Arguments
+            if (
+                $targetPath -ne $expectedShortcutTarget -or
+                (-not [string]::IsNullOrWhiteSpace($arguments))
+            ) {
+                $shortcutIssues.Add("$shortcutPath => target='$targetPath' args='$arguments'")
+            }
+        }
+    } catch {
+        $shortcutIssues.Add("shortcut-check-failed: $($_.Exception.Message)")
+    }
+
+    if ($shortcutIssues.Count -gt 0) {
+        $reasons.Add("shortcut-drift")
+    }
+
+    foreach ($definition in (Get-ExpectedShellCommandDefinitions -WrapperExe $SourceWrapperExe)) {
+        try {
+            $currentValue = (Get-ItemProperty -Path $definition.KeyPath -ErrorAction Stop).'(default)'
+            if ($currentValue -ne $definition.CommandValue) {
+                $shellIssues.Add("{0} => '{1}'" -f $definition.KeyPath, $currentValue)
+            }
+        } catch {
+            $shellIssues.Add("{0} => missing" -f $definition.KeyPath)
+        }
+    }
+
+    if ($shellIssues.Count -gt 0) {
+        $reasons.Add("shell-command-drift")
+    }
+
+    $reasonArray = @($reasons.ToArray() | Select-Object -Unique)
+
+    return [pscustomobject]@{
+        IsHealthy = $reasonArray.Count -eq 0
+        InstallState = $installState.State
+        Reasons = $reasonArray
+        CodeSource = $codeSource
+        ShortcutIssues = $shortcutIssues.ToArray()
+        ShellIssues = $shellIssues.ToArray()
+        ShimIssues = $shimIssues.ToArray()
+        ArgvIssues = $argvIssues.ToArray()
+        ArgvStatus = $argvStatus
+    }
+}
+
 function Install-CDPLaunchHooks {
-    param([switch]$Quiet)
+    param(
+        [switch]$Quiet,
+        [string]$TriggerSource = "startup",
+        [string[]]$DetectionReasons = @()
+    )
 
     Ensure-UsableTempEnvironment -PersistUserVariables
     $wrapperExe = Ensure-CodeWrapperCompiled -Quiet:$Quiet
+    $repairTimer = [System.Diagnostics.Stopwatch]::StartNew()
     Write-RepairLog "Starting CDP launch hook repair."
+    Write-RepairLog "Repair trigger source: $TriggerSource"
+    if ($DetectionReasons.Count -gt 0) {
+        Write-RepairLog "Repair detection reasons: $($DetectionReasons -join '; ')"
+    }
 
     try {
         Remove-Item -LiteralPath $IfeoKey -Recurse -Force -ErrorAction SilentlyContinue
@@ -553,7 +952,9 @@ function Install-CDPLaunchHooks {
 
     $installState = $null
     try {
+        $stageTimer = [System.Diagnostics.Stopwatch]::StartNew()
         $installState = Install-CodeExeSwap -SourceWrapperExe $wrapperExe -Quiet:$Quiet
+        Write-RepairLog "Repair stage install swap completed in $(Format-RepairElapsed -Stopwatch $stageTimer)."
     } catch {
         Write-RepairLog "Code.exe swap repair failed: $($_.Exception.Message)" "ERROR"
         if (-not $Quiet) {
@@ -562,9 +963,10 @@ function Install-CDPLaunchHooks {
     }
 
     try {
+        $stageTimer = [System.Diagnostics.Stopwatch]::StartNew()
         Install-CodeShims -SourceWrapperExe $wrapperExe -Quiet:$Quiet
         Ensure-UserPathPrefix -PrefixPath $ShimDir -Quiet:$Quiet
-        Write-RepairLog "Shim directory and PATH prefix refreshed."
+        Write-RepairLog "Shim directory and PATH prefix refreshed in $(Format-RepairElapsed -Stopwatch $stageTimer)."
     } catch {
         Write-RepairLog "Shim repair failed: $($_.Exception.Message)" "ERROR"
         if (-not $Quiet) {
@@ -573,20 +975,50 @@ function Install-CDPLaunchHooks {
     }
 
     try {
+        $stageTimer = [System.Diagnostics.Stopwatch]::StartNew()
+        $argvUpdated = Ensure-VSCodeArgvJsonPort
+        $argvStatus = Get-VSCodeArgvJsonStatus
+        $argvSummary =
+            if ($argvStatus.MatchesPort) {
+                "configured for port $($argvStatus.RawValue)"
+            } elseif (-not [string]::IsNullOrWhiteSpace($argvStatus.RawValue)) {
+                "configured for unexpected value '$($argvStatus.RawValue)'"
+            } else {
+                "missing remote-debugging-port"
+            }
+        Write-RepairLog "argv.json checked in $(Format-RepairElapsed -Stopwatch $stageTimer): $argvSummary$(if ($argvUpdated) { ' (updated)' } else { '' })."
+    } catch {
+        Write-RepairLog "argv.json repair failed: $($_.Exception.Message)" "ERROR"
+        if (-not $Quiet) {
+            Write-Host "argv.json repair failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+
+    try {
+        $codeCmdInfo = Get-Command code -ErrorAction SilentlyContinue
+        if ($codeCmdInfo) {
+            $codeSource = $codeCmdInfo.Source
+            $level = if ($codeSource -like "$ShimDir*") { "INFO" } else { "WARN" }
+            Write-RepairLog "Shell `code` resolves to $codeSource" $level
+        } else {
+            Write-RepairLog "Shell `code` command missing from PATH" "WARN"
+        }
+    } catch {
+        Write-RepairLog "Failed to resolve shell `code`: $($_.Exception.Message)" "WARN"
+    }
+
+    try {
+        $stageTimer = [System.Diagnostics.Stopwatch]::StartNew()
         $wshShell = New-Object -ComObject WScript.Shell
         $effectiveState = if ($installState) { $installState } else { Get-CodeInstallState -SourceWrapperExe $wrapperExe }
         $shortcutTargetPath = if ($effectiveState.State -eq "managed") { $ManagedCodePath } else { $wrapperExe }
         $iconTargetPath = if (Test-Path -LiteralPath $ManagedRealCodePath) { $ManagedRealCodePath } else { $ManagedCodePath }
-        $shortcutTargets = @(
-            "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Visual Studio Code\Visual Studio Code.lnk",
-            "$env:APPDATA\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\Visual Studio Code.lnk",
-            "$env:USERPROFILE\Desktop\Visual Studio Code.lnk"
-        )
+        $shortcutTargets = Get-ManagedShortcutPaths
 
         foreach ($shortcutPath in $shortcutTargets) {
             Set-ShortcutTarget -WshShell $wshShell -ShortcutPath $shortcutPath -TargetPath $shortcutTargetPath -Arguments "" -IconTargetPath $iconTargetPath
         }
-        Write-RepairLog "Shortcut targets refreshed to $shortcutTargetPath."
+        Write-RepairLog "Shortcut targets refreshed to $shortcutTargetPath in $(Format-RepairElapsed -Stopwatch $stageTimer)."
     } catch {
         Write-RepairLog "Shortcut repair failed: $($_.Exception.Message)" "ERROR"
         if (-not $Quiet) {
@@ -595,11 +1027,11 @@ function Install-CDPLaunchHooks {
     }
 
     try {
-        Set-RegistryCommand -KeyPath "HKCU:\Software\Classes\Applications\Code.exe\shell\open\command" -CommandValue ('"{0}" "%1"' -f $wrapperExe)
-        Set-RegistryCommand -KeyPath "HKCU:\Software\Classes\VSCodeSourceFile\shell\open\command" -CommandValue ('"{0}" "%1"' -f $wrapperExe)
-        Set-RegistryCommand -KeyPath "HKCU:\Software\Classes\Directory\shell\VSCode\command" -CommandValue ('"{0}" "%V"' -f $wrapperExe)
-        Set-RegistryCommand -KeyPath "HKCU:\Software\Classes\Directory\Background\shell\VSCode\command" -CommandValue ('"{0}" "%V"' -f $wrapperExe)
-        Write-RepairLog "Shell command overrides refreshed."
+        $stageTimer = [System.Diagnostics.Stopwatch]::StartNew()
+        foreach ($definition in (Get-ExpectedShellCommandDefinitions -WrapperExe $wrapperExe)) {
+            Set-RegistryCommand -KeyPath $definition.KeyPath -CommandValue $definition.CommandValue
+        }
+        Write-RepairLog "Shell command overrides refreshed in $(Format-RepairElapsed -Stopwatch $stageTimer)."
     } catch {
         Write-RepairLog "Shell command repair failed: $($_.Exception.Message)" "ERROR"
         if (-not $Quiet) {
@@ -607,7 +1039,23 @@ function Install-CDPLaunchHooks {
         }
     }
 
-    Write-RepairLog "Completed CDP launch hook repair."
+    try {
+        $stageTimer = [System.Diagnostics.Stopwatch]::StartNew()
+        $postRepairStatus = Get-CDPLaunchSurfaceStatus -SourceWrapperExe $wrapperExe
+        Write-RepairLog "Post-repair launch surface healthy: $($postRepairStatus.IsHealthy)"
+        Write-RepairLog "Post-repair code command source: $($postRepairStatus.CodeSource)"
+        Write-RepairLog "Post-repair shortcut integrity healthy: $($postRepairStatus.ShortcutIssues.Count -eq 0)"
+        Write-RepairLog "Post-repair shell-command integrity healthy: $($postRepairStatus.ShellIssues.Count -eq 0)"
+        Write-RepairLog "Post-repair argv.json configured for current port: $($postRepairStatus.ArgvStatus.MatchesPort)"
+        if ($postRepairStatus.Reasons.Count -gt 0) {
+            Write-RepairLog "Post-repair remaining reasons: $($postRepairStatus.Reasons -join '; ')" "WARN"
+        }
+        Write-RepairLog "Repair stage post-check completed in $(Format-RepairElapsed -Stopwatch $stageTimer)."
+    } catch {
+        Write-RepairLog "Post-repair integrity check failed: $($_.Exception.Message)" "WARN"
+    }
+
+    Write-RepairLog "Completed CDP launch hook repair in $(Format-RepairElapsed -Stopwatch $repairTimer)."
 
     if (-not $Quiet) {
         Write-Host "CDP launch hooks refreshed." -ForegroundColor Green
@@ -635,13 +1083,155 @@ function Uninstall-StartupRepair {
     }
 }
 
+function Get-CDPRuntimeStatus {
+    $endpointStatus = Get-CDPStatus
+    $launchStatus = Get-CDPLaunchSurfaceStatus
+    $repairInProgress = Test-CDPRepairInProgress
+    $argvStatus = $launchStatus.ArgvStatus
+
+    $launchHookLabel =
+        if ($repairInProgress -and -not $launchStatus.IsHealthy) {
+            "launch hooks drift detected, repairing"
+        } elseif ($repairInProgress) {
+            "startup self-heal running"
+        } elseif ($launchStatus.IsHealthy) {
+            "launch hooks healthy"
+        } else {
+            "launch hooks drift detected, repair pending"
+        }
+
+    $endpointLabel = if ($endpointStatus.EndpointReady) { "active" } else { "endpoint inactive" }
+    $argvLabel =
+        if ($argvStatus.MatchesPort) {
+            "argv.json configured"
+        } elseif (-not [string]::IsNullOrWhiteSpace($argvStatus.RawValue)) {
+            "argv.json port mismatch"
+        } else {
+            "argv.json missing CDP port"
+        }
+
+    return [pscustomobject]@{
+        EndpointStatus = $endpointStatus
+        LaunchStatus = $launchStatus
+        ArgvStatus = $argvStatus
+        RepairInProgress = $repairInProgress
+        EndpointLabel = $endpointLabel
+        LaunchHookLabel = $launchHookLabel
+        ArgvLabel = $argvLabel
+        BannerText = "$endpointLabel; $launchHookLabel; $argvLabel"
+    }
+}
+
+function Invoke-CDPLaunchRepairIfNeeded {
+    param(
+        [string]$TriggerSource,
+        [switch]$WriteConsoleNotice,
+        [switch]$RunInBackground,
+        [switch]$LogHealthySkip
+    )
+
+    $argvEnsureResult = Invoke-VSCodeArgvJsonEnsure -TriggerSource $TriggerSource -WriteConsoleNotice:$WriteConsoleNotice
+    $status = Get-CDPLaunchSurfaceStatus
+    $result = [ordered]@{
+        ArgvEnsure = $argvEnsureResult
+        Status = $status
+        Action = "none"
+        RepairQueued = $false
+        RepairCompleted = $false
+        RepairInProgress = Test-CDPRepairInProgress
+    }
+
+    if ($status.IsHealthy) {
+        if ($LogHealthySkip) {
+            Write-RepairLog "Repair skipped because launch hooks are already healthy for source '$TriggerSource'."
+        }
+
+        $result.Action = "healthy"
+        return [pscustomobject]$result
+    }
+
+    if ($result.RepairInProgress) {
+        $now = Get-Date
+        if ((($now - $script:LastRepairLockNoticeAt).TotalMilliseconds -ge $RepairDebounceMs) -or $script:LastRepairLockNoticeAt -eq [DateTime]::MinValue) {
+            Write-RepairLog "Repair already in progress; source=$TriggerSource reused the in-flight repair."
+            $script:LastRepairLockNoticeAt = $now
+        }
+
+        if ($WriteConsoleNotice) {
+            Write-Host "  CDP launch repair already in progress - leaving current windows alone while hooks finish healing..." -ForegroundColor Yellow
+        }
+
+        $result.Action = "repair-in-progress"
+        return [pscustomobject]$result
+    }
+
+    $reasonSignature = ($status.Reasons -join '|')
+    $now = Get-Date
+    if (
+        $reasonSignature -eq $script:LastDriftSignature -and
+        (($now - $script:LastDriftRepairAt).TotalMilliseconds -lt $RepairDebounceMs)
+    ) {
+        $result.Action = "debounced"
+        return [pscustomobject]$result
+    }
+
+    $script:LastDriftSignature = $reasonSignature
+    $script:LastDriftRepairAt = $now
+
+    Write-RepairLog "vs code updated restarting and implementing CDP"
+    Write-RepairLog "Drift trigger source: $TriggerSource"
+    Write-RepairLog "Drift reasons: $($status.Reasons -join '; ')"
+    if ($status.ShortcutIssues.Count -gt 0) {
+        Write-RepairLog "Shortcut drift details: $($status.ShortcutIssues -join ' || ')" "WARN"
+    }
+    if ($status.ShellIssues.Count -gt 0) {
+        Write-RepairLog "Shell-command drift details: $($status.ShellIssues -join ' || ')" "WARN"
+    }
+    if ($status.ShimIssues.Count -gt 0) {
+        Write-RepairLog "Shim drift details: $($status.ShimIssues -join '; ')" "WARN"
+    }
+    if ($status.ArgvIssues.Count -gt 0) {
+        Write-RepairLog "argv.json drift details: $($status.ArgvIssues -join '; ')" "WARN"
+    }
+
+    if ($WriteConsoleNotice) {
+        Write-Host "  VS Code drift detected - repairing CDP launch hooks..." -ForegroundColor Yellow
+    }
+
+    if ($RunInBackground) {
+        if (Start-CDPBackgroundRepair -TriggerSource $TriggerSource) {
+            $result.Action = "repair-queued"
+            $result.RepairQueued = $true
+        } else {
+            $result.Action = "repair-queue-failed"
+        }
+
+        return [pscustomobject]$result
+    }
+
+    $repairOutcome = Invoke-CDPLaunchRepairCore -TriggerSource $TriggerSource -DetectionReasons $status.Reasons
+    $result.Action = $repairOutcome
+    $result.RepairCompleted = $repairOutcome -eq "completed"
+    $result.RepairInProgress = $repairOutcome -eq "locked"
+    return [pscustomobject]$result
+}
+
+function Invoke-CDPIntegrityWatcherTick {
+    $now = Get-Date
+    if (($now - $script:LastIntegrityPollAt).TotalMilliseconds -lt $IntegrityPollIntervalMs) {
+        return
+    }
+
+    $script:LastIntegrityPollAt = $now
+    [void](Invoke-CDPLaunchRepairIfNeeded -TriggerSource "watcher" -RunInBackground)
+}
+
 if ($UninstallStartup) {
     Uninstall-StartupRepair
     exit 0
 }
 
 Ensure-UsableTempEnvironment
-Install-CDPLaunchHooks -Quiet
 Install-StartupRepair -Quiet
 
 if ($InstallStartup) {
@@ -649,9 +1239,17 @@ if ($InstallStartup) {
     exit 0
 }
 
-if ($StartupRepairOnly) {
+if ($RepairOnly) {
+    [void](Invoke-CDPLaunchRepairIfNeeded -TriggerSource $RepairTriggerSource -LogHealthySkip)
     exit 0
 }
+
+if ($StartupRepairOnly) {
+    [void](Invoke-CDPLaunchRepairIfNeeded -TriggerSource "startup" -LogHealthySkip)
+    exit 0
+}
+
+$initialRepairResult = Invoke-CDPLaunchRepairIfNeeded -TriggerSource "startup" -RunInBackground
 
 # ============================================================
 
@@ -700,6 +1298,9 @@ public class WinAPI {
     // For message loop
     [DllImport("user32.dll")]
     public static extern int GetMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
+
+    [DllImport("user32.dll")]
+    public static extern bool PeekMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax, uint wRemoveMsg);
 
     [DllImport("user32.dll")]
     public static extern bool TranslateMessage(ref MSG lpMsg);
@@ -766,6 +1367,7 @@ public class WinAPI {
 
     public const int WM_HOTKEY = 0x0312;
     public const int WM_CLOSE = 0x0010;
+    public const uint PM_REMOVE = 0x0001;
 
     [DllImport("user32.dll")]
     public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
@@ -833,11 +1435,23 @@ public class WinAPI {
 }
 "@
 
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class CommandLineHelper {
+    [DllImport("shell32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern IntPtr CommandLineToArgvW(string lpCmdLine, out int pNumArgs);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr LocalFree(IntPtr hMem);
+}
+"@ -ErrorAction SilentlyContinue
+
 # Load Windows Forms for SendKeys
 Add-Type -AssemblyName System.Windows.Forms
 
 # CDP port for Chrome DevTools Protocol
-$CDPPort = 9222
 
 # Window position settings for your monitors
 # DISPLAY6 (left):  X=0,    Y=1083, WorkingArea height=1032
@@ -931,14 +1545,114 @@ function Get-CDPStatus {
     }
 }
 
+function Find-CDPPageTarget {
+    param(
+        [object[]]$Targets,
+        [string]$WindowTitle = "",
+        [switch]$AllowWorkbenchFallback
+    )
+
+    $pageTargets = @($Targets | Where-Object { $null -ne $_ -and $_.type -eq "page" })
+    $workbenchTargets = @($pageTargets | Where-Object { $_.url -match "workbench" })
+    $target = $null
+    $matchKind = ""
+
+    if (-not [string]::IsNullOrWhiteSpace($WindowTitle)) {
+        $target = $pageTargets | Where-Object { $_.title -eq $WindowTitle } | Select-Object -First 1
+        if ($null -ne $target) {
+            $matchKind = "exact"
+        }
+
+        if ($null -eq $target) {
+            $escapedTitle = [regex]::Escape($WindowTitle)
+            $target = $pageTargets | Where-Object { $_.title -match $escapedTitle } | Select-Object -First 1
+            if ($null -ne $target) {
+                $matchKind = "partial"
+            }
+        }
+    }
+
+    if ($null -eq $target -and $AllowWorkbenchFallback) {
+        $target = $workbenchTargets | Select-Object -First 1
+        if ($null -ne $target) {
+            $matchKind = "workbench-fallback"
+        }
+    }
+
+    return [pscustomobject]@{
+        Target = $target
+        MatchKind = $matchKind
+        PageCount = $pageTargets.Count
+        WorkbenchPageCount = $workbenchTargets.Count
+    }
+}
+
+function Get-CDPWindowTargetStatus {
+    param(
+        [string]$WindowTitle = "",
+        [switch]$AllowWorkbenchFallback
+    )
+
+    $status = Get-CDPStatus
+    $targets = @()
+    $targetsReady = $false
+    $targetsErrorMessage = ""
+    $targetMatch = [pscustomobject]@{
+        Target = $null
+        MatchKind = ""
+        PageCount = 0
+        WorkbenchPageCount = 0
+    }
+
+    if ($status.EndpointReady) {
+        try {
+            $rawTargets = Invoke-RestMethod -Uri "http://127.0.0.1:$($status.Port)/json" -TimeoutSec 2 -ErrorAction Stop
+            $targets = @($rawTargets | Where-Object { $null -ne $_ })
+            $targetsReady = $true
+            $targetMatch = Find-CDPPageTarget -Targets $targets -WindowTitle $WindowTitle -AllowWorkbenchFallback:$AllowWorkbenchFallback
+        } catch {
+            $targetsErrorMessage = $_.Exception.Message
+        }
+    }
+
+    return [pscustomobject]@{
+        Port = $status.Port
+        Source = $status.Source
+        FileExists = $status.FileExists
+        BrowserPath = $status.BrowserPath
+        Browser = $status.Browser
+        EndpointReady = $status.EndpointReady
+        EndpointErrorMessage = $status.ErrorMessage
+        TargetsReady = $targetsReady
+        TargetsErrorMessage = $targetsErrorMessage
+        TargetCount = $targets.Count
+        PageCount = $targetMatch.PageCount
+        WorkbenchPageCount = $targetMatch.WorkbenchPageCount
+        WindowTargetMatched = $null -ne $targetMatch.Target
+        TargetTitle = if ($null -ne $targetMatch.Target) { $targetMatch.Target.title } else { "" }
+        TargetUrl = if ($null -ne $targetMatch.Target) { $targetMatch.Target.url } else { "" }
+        TargetMatchKind = $targetMatch.MatchKind
+    }
+}
+
 function Connect-CDPWebSocket {
     param(
         [string]$WindowTitle = ""
     )
 
     try {
-        $endpoint = Get-CDPEndpointInfo
-        $targets = Invoke-RestMethod -Uri "http://127.0.0.1:$($endpoint.Port)/json" -TimeoutSec 3 -ErrorAction Stop
+        $targetStatus = Get-CDPWindowTargetStatus -WindowTitle $WindowTitle -AllowWorkbenchFallback
+        $endpoint = [pscustomobject]@{
+            Port = $targetStatus.Port
+            Source = $targetStatus.Source
+            FileExists = $targetStatus.FileExists
+        }
+        $targets = @()
+        if ($targetStatus.TargetsReady) {
+            $targets = Invoke-RestMethod -Uri "http://127.0.0.1:$($endpoint.Port)/json" -TimeoutSec 3 -ErrorAction Stop
+        } else {
+            throw $targetStatus.TargetsErrorMessage
+        }
 
         # Debug: log all targets
         Write-Host "    [DEBUG] CDP targets found: $($targets.Count) on port $($endpoint.Port) ($($endpoint.Source))" -ForegroundColor DarkGray
@@ -952,39 +1666,15 @@ function Connect-CDPWebSocket {
             Write-Host "    [DEBUG] Looking for window: '$WindowTitle'" -ForegroundColor DarkGray
         }
 
-        # Find the correct CDP target
-        $target = $null
+        $targetMatch = Find-CDPPageTarget -Targets $targets -WindowTitle $WindowTitle -AllowWorkbenchFallback
+        $target = $targetMatch.Target
 
-        # 1. If we have a window title, match it exactly (the CDP target title = VS Code window title)
-        if ($WindowTitle) {
-            foreach ($t in $targets) {
-                if ($t.type -eq "page" -and $t.title -eq $WindowTitle) {
-                    $target = $t
-                    Write-Host "    [DEBUG] Exact title match!" -ForegroundColor DarkGray
-                    break
-                }
-            }
-        }
-
-        # 2. If no exact match, try partial match on window title
-        if ($null -eq $target -and $WindowTitle) {
-            foreach ($t in $targets) {
-                if ($t.type -eq "page" -and $t.title -match [regex]::Escape($WindowTitle)) {
-                    $target = $t
-                    Write-Host "    [DEBUG] Partial title match" -ForegroundColor DarkGray
-                    break
-                }
-            }
-        }
-
-        # 3. Fall back to any workbench page
-        if ($null -eq $target) {
-            foreach ($t in $targets) {
-                if ($t.type -eq "page" -and $t.url -match "workbench") {
-                    $target = $t
-                    break
-                }
-            }
+        if ($targetMatch.MatchKind -eq "exact") {
+            Write-Host "    [DEBUG] Exact title match!" -ForegroundColor DarkGray
+        } elseif ($targetMatch.MatchKind -eq "partial") {
+            Write-Host "    [DEBUG] Partial title match" -ForegroundColor DarkGray
+        } elseif ($targetMatch.MatchKind -eq "workbench-fallback") {
+            Write-Host "    [DEBUG] Falling back to first workbench page" -ForegroundColor DarkGray
         }
 
         if ($null -eq $target -or [string]::IsNullOrEmpty($target.webSocketDebuggerUrl)) {
@@ -1319,6 +2009,111 @@ function Get-ProcessCommandLine {
     }
 }
 
+function Convert-CommandLineToArguments {
+    param([string]$CommandLine)
+
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) {
+        return @()
+    }
+
+    $argc = 0
+    $argvPtr = [CommandLineHelper]::CommandLineToArgvW($CommandLine, [ref]$argc)
+    if ($argvPtr -eq [IntPtr]::Zero -or $argc -le 0) {
+        return @()
+    }
+
+    $args = New-Object 'System.Collections.Generic.List[string]'
+    $intPtrSize = [IntPtr]::Size
+    try {
+        for ($i = 0; $i -lt $argc; $i++) {
+            $ptr = [System.Runtime.InteropServices.Marshal]::ReadIntPtr($argvPtr, $i * $intPtrSize)
+            $args.Add([System.Runtime.InteropServices.Marshal]::PtrToStringUni($ptr))
+        }
+    } finally {
+        [CommandLineHelper]::LocalFree($argvPtr) | Out-Null
+    }
+
+    return $args.ToArray()
+}
+
+function Get-VSCodeWindowArguments {
+    param([IntPtr]$hwnd)
+
+    $procId = Get-VSCodeWindowProcessId -hwnd $hwnd
+    if ($null -eq $procId) {
+        return @()
+    }
+
+    $commandLine = Get-ProcessCommandLine -ProcessId $procId
+    if ([string]::IsNullOrWhiteSpace($commandLine)) {
+        return @()
+    }
+
+    $args = Convert-CommandLineToArguments -CommandLine $commandLine
+    if ($args.Count -le 1) {
+        return @()
+    }
+
+    return $args[1..($args.Count - 1)]
+}
+
+function Get-VSCodeWindowExecutablePath {
+    param([IntPtr]$hwnd)
+
+    $procId = Get-VSCodeWindowProcessId -hwnd $hwnd
+    if ($null -eq $procId) {
+        return ""
+    }
+
+    $commandLine = Get-ProcessCommandLine -ProcessId $procId
+    if ([string]::IsNullOrWhiteSpace($commandLine)) {
+        return ""
+    }
+
+    $args = Convert-CommandLineToArguments -CommandLine $commandLine
+    if ($args.Count -eq 0) {
+        return ""
+    }
+
+    return $args[0]
+}
+
+function Ensure-CDPFlagInArgs {
+    param([string[]]$Arguments)
+
+    if (-not $Arguments) {
+        $Arguments = @()
+    }
+
+    $args = @()
+    $flagFound = $false
+    for ($i = 0; $i -lt $Arguments.Count; $i++) {
+        $arg = $Arguments[$i]
+        if ($arg -like '--remote-debugging-port=*') {
+            $flagFound = $true
+            $args += "--remote-debugging-port=$CDPPort"
+            continue
+        }
+
+        if ($arg -ieq '--remote-debugging-port') {
+            $flagFound = $true
+            if ($i + 1 -lt $Arguments.Count) {
+                $i++
+            }
+            $args += "--remote-debugging-port=$CDPPort"
+            continue
+        }
+
+        $args += $arg
+    }
+
+    if (-not $flagFound) {
+        $args += "--remote-debugging-port=$CDPPort"
+    }
+
+    return $args
+}
+
 function Test-VSCodeWindowHasCDPFlag {
     param([IntPtr]$hwnd)
 
@@ -1336,18 +2131,47 @@ function Test-VSCodeWindowHasCDPFlag {
 }
 
 function Get-VSCodeWindowCDPState {
-    param([IntPtr]$hwnd)
+    param(
+        [IntPtr]$hwnd,
+        [string]$WindowTitle = ""
+    )
 
-    $status = Get-CDPStatus
+    $effectiveWindowTitle =
+        if ([string]::IsNullOrWhiteSpace($WindowTitle)) {
+            Get-VSCodeWindowTitle -hwnd $hwnd
+        } else {
+            $WindowTitle
+        }
+
+    $targetStatus = Get-CDPWindowTargetStatus -WindowTitle $effectiveWindowTitle
+    $argvStatus = Get-VSCodeArgvJsonStatus
 
     return [pscustomobject]@{
-        HasFlag = Test-VSCodeWindowHasCDPFlag -hwnd $hwnd
-        EndpointReady = $status.EndpointReady
-        Port = $status.Port
-        Source = $status.Source
-        FileExists = $status.FileExists
-        BrowserPath = $status.BrowserPath
-        ErrorMessage = $status.ErrorMessage
+        WindowTitle = $effectiveWindowTitle
+        FlagVisible = Test-VSCodeWindowHasCDPFlag -hwnd $hwnd
+        ArgvConfigured = $argvStatus.MatchesPort
+        ArgvPort = $argvStatus.RawValue
+        EndpointReady = $targetStatus.EndpointReady
+        TargetsReady = $targetStatus.TargetsReady
+        WindowTargetMatched = $targetStatus.WindowTargetMatched
+        TargetTitle = $targetStatus.TargetTitle
+        TargetUrl = $targetStatus.TargetUrl
+        TargetMatchKind = $targetStatus.TargetMatchKind
+        TargetCount = $targetStatus.TargetCount
+        WorkbenchPageCount = $targetStatus.WorkbenchPageCount
+        Port = $targetStatus.Port
+        Source = $targetStatus.Source
+        FileExists = $targetStatus.FileExists
+        BrowserPath = $targetStatus.BrowserPath
+        Browser = $targetStatus.Browser
+        ErrorMessage =
+            if (-not $targetStatus.EndpointReady) {
+                $targetStatus.EndpointErrorMessage
+            } elseif (-not $targetStatus.TargetsReady) {
+                $targetStatus.TargetsErrorMessage
+            } else {
+                ""
+            }
     }
 }
 
@@ -1358,6 +2182,16 @@ function Restart-VSCodeWithCDP {
     )
 
     Write-Host "  Restarting this VS Code window with CDP flag..." -ForegroundColor Cyan
+
+    $procId = Get-VSCodeWindowProcessId -hwnd $hwnd
+    $originalCommandLine = if ($procId) { Get-ProcessCommandLine -ProcessId $procId } else { "" }
+    $titleFilter = if ([string]::IsNullOrWhiteSpace($ExpectedTitle)) { Get-VSCodeWindowTitle -hwnd $hwnd } else { $ExpectedTitle }
+    $originalArgs = Get-VSCodeWindowArguments -hwnd $hwnd
+    $finalArgs = Ensure-CDPFlagInArgs -Arguments $originalArgs
+
+    if (-not [string]::IsNullOrWhiteSpace($originalCommandLine)) {
+        Write-RepairLog "Restart triggered for '$titleFilter' with command line: $originalCommandLine"
+    }
 
     # Gracefully close ONLY this window (WM_CLOSE, not kill all processes)
     [WinAPI]::PostMessage($hwnd, [WinAPI]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
@@ -1370,12 +2204,11 @@ function Restart-VSCodeWithCDP {
         return $null
     }
 
-    Start-Process -FilePath $codePath -ArgumentList "--remote-debugging-port=$CDPPort"
+    Start-Process -FilePath $codePath -ArgumentList $finalArgs
 
     # Wait for new VS Code window
     $waited = 0
     $newHwnd = $null
-    $titleFilter = if ([string]::IsNullOrWhiteSpace($ExpectedTitle)) { Get-VSCodeWindowTitle -hwnd $hwnd } else { $ExpectedTitle }
     while ($waited -lt 15000) {
         if ($titleFilter) {
             $newHwnd = Find-VSCodeWindow -TargetTitle $titleFilter
@@ -1480,6 +2313,11 @@ function Set-PanelWidth {
         [IntPtr]$WindowHandle = [IntPtr]::Zero
     )
 
+    $repairResult = Invoke-CDPLaunchRepairIfNeeded -TriggerSource "hotkey integrity check" -WriteConsoleNotice -RunInBackground
+    if ($repairResult.RepairQueued) {
+        Start-Sleep -Milliseconds 150
+    }
+
     # Try CDP first (no cursor movement)
     $cdpResult = Set-AuxiliaryBarWidthCDP -TargetWidth $Width -WindowTitle $WindowTitle -ExpectedWindowWidth $WindowWidth
     if ($cdpResult) {
@@ -1487,9 +2325,18 @@ function Set-PanelWidth {
     }
 
     if ($WindowHandle -ne [IntPtr]::Zero) {
-        $windowCDPState = Get-VSCodeWindowCDPState -hwnd $WindowHandle
-        if ($windowCDPState.HasFlag -and $windowCDPState.EndpointReady) {
-            Write-Host "  Target window has CDP flag and reachable endpoint on port $($windowCDPState.Port) ($($windowCDPState.Source)) - retrying once without restart..." -ForegroundColor Yellow
+        $windowCDPState = Get-VSCodeWindowCDPState -hwnd $WindowHandle -WindowTitle $WindowTitle
+        if ($windowCDPState.EndpointReady -and $windowCDPState.WindowTargetMatched) {
+            $cdpSource =
+                if ($windowCDPState.ArgvConfigured) {
+                    "argv.json"
+                } elseif ($windowCDPState.FlagVisible) {
+                    "process args"
+                } else {
+                    "live endpoint"
+                }
+
+            Write-Host "  CDP is live for this window on port $($windowCDPState.Port) ($($windowCDPState.Source)); target match '$($windowCDPState.TargetMatchKind)' via $cdpSource - retrying once without restart..." -ForegroundColor Yellow
             Start-Sleep -Milliseconds 500
 
             $retryResult = Set-AuxiliaryBarWidthCDP -TargetWidth $Width -WindowTitle $WindowTitle -ExpectedWindowWidth $WindowWidth
@@ -1497,37 +2344,60 @@ function Set-PanelWidth {
                 return $true
             }
 
-            Write-Host "  CDP endpoint is reachable, but resize still failed; restart skipped because CDP is alive" -ForegroundColor Yellow
+            Write-Host "  CDP is live for this window, but resize still failed for another reason; window left open." -ForegroundColor Yellow
+            Write-RepairLog "Current window '$WindowTitle' has a live CDP target, but panel resize still failed."
             return $false
         }
 
-        if ($windowCDPState.HasFlag -and -not $windowCDPState.EndpointReady) {
-            $sourceText = if ($windowCDPState.FileExists) { "$($windowCDPState.Source)" } else { "default port" }
-            Write-Host "  Target window has CDP flag but endpoint is unavailable on port $($windowCDPState.Port) ($sourceText): $($windowCDPState.ErrorMessage)" -ForegroundColor Yellow
+        if ($windowCDPState.EndpointReady -and $windowCDPState.TargetsReady -and -not $windowCDPState.WindowTargetMatched) {
+            Write-Host "  CDP browser is live on port $($windowCDPState.Port), but this window target is not visible yet (targets=$($windowCDPState.TargetCount)); retrying once..." -ForegroundColor Yellow
+            Start-Sleep -Milliseconds 500
+
+            $windowCDPState = Get-VSCodeWindowCDPState -hwnd $WindowHandle -WindowTitle $WindowTitle
+            if ($windowCDPState.WindowTargetMatched) {
+                $retryResult = Set-AuxiliaryBarWidthCDP -TargetWidth $Width -WindowTitle $WindowTitle -ExpectedWindowWidth $WindowWidth
+                if ($retryResult) {
+                    return $true
+                }
+
+                Write-Host "  CDP target appeared for this window, but resize still failed for another reason; window left open." -ForegroundColor Yellow
+                Write-RepairLog "Current window '$WindowTitle' matched a live CDP target after retry, but panel resize still failed."
+                return $false
+            }
+
+            Write-Host "  CDP browser is live but this window target is not visible yet; leaving window open." -ForegroundColor Yellow
+            Write-RepairLog "Current window '$WindowTitle' did not appear in the live CDP target list yet; leaving window open."
+            return $false
         }
-    }
 
-    # CDP not available — gracefully restart this VS Code window with the flag
-    if ($WindowHandle -ne [IntPtr]::Zero) {
-        $newHwnd = Restart-VSCodeWithCDP -hwnd $WindowHandle -ExpectedTitle $WindowTitle
-        if ($null -ne $newHwnd) {
-            # Reposition the new window
-            [WinAPI]::ShowWindow($newHwnd, 9) | Out-Null
-            [WinAPI]::MoveWindow($newHwnd, $WindowX, $WindowY, $WindowWidth, $WindowHeight, $true) | Out-Null
-            [WinAPI]::SetForegroundWindow($newHwnd) | Out-Null
-            Start-Sleep -Milliseconds 50
+        if ($windowCDPState.EndpointReady -and -not $windowCDPState.TargetsReady) {
+            Write-Host "  CDP browser is live on port $($windowCDPState.Port), but the target list is unavailable: $($windowCDPState.ErrorMessage)" -ForegroundColor Yellow
+            Write-RepairLog "Current window '$WindowTitle' has a live CDP endpoint, but the target list is unavailable; leaving window open."
+        }
 
-            # Get new window title
-            $newTitle = Get-VSCodeWindowTitle -hwnd $newHwnd
+        if (-not $windowCDPState.EndpointReady) {
+            $sourceText = if ($windowCDPState.FileExists) { "$($windowCDPState.Source)" } else { "default port" }
+            $argvText =
+                if ($windowCDPState.ArgvConfigured) {
+                    " argv.json is configured for port $($windowCDPState.ArgvPort)."
+                } elseif ($windowCDPState.FlagVisible) {
+                    " The process args do show the CDP flag."
+                } else {
+                    ""
+                }
 
-            $cdpResult = Set-AuxiliaryBarWidthCDP -TargetWidth $Width -WindowTitle $newTitle -ExpectedWindowWidth $WindowWidth
-            if ($cdpResult) {
-                return $true
+            if ($repairResult.RepairQueued -or $repairResult.RepairInProgress) {
+                Write-Host "  CDP endpoint unavailable on port $($windowCDPState.Port) ($sourceText) while launch-hook self-heal is still running: $($windowCDPState.ErrorMessage)$argvText" -ForegroundColor Yellow
+                Write-RepairLog "Current window '$WindowTitle' is waiting on launch-hook self-heal before CDP becomes reachable."
+            } else {
+                Write-Host "  CDP endpoint unavailable on port $($windowCDPState.Port) ($sourceText): $($windowCDPState.ErrorMessage)$argvText" -ForegroundColor Yellow
+                Write-RepairLog "Current window '$WindowTitle' does not have a reachable CDP endpoint; leaving window open."
             }
         }
     }
 
-    Write-Host "  CDP failed - panel not resized" -ForegroundColor Red
+    # CDP not available — gracefully restart this VS Code window with the flag
+    Write-Host "  CDP unavailable on this window - window left open, panel not resized. The next hotkey run will retry once the live endpoint/target is ready." -ForegroundColor Yellow
     return $false
 }
 
@@ -1669,8 +2539,8 @@ Write-Host "  Ctrl+Alt+N - Top monitors layout (panel full)" -ForegroundColor Ye
 Write-Host ""
 Write-Host "  Dual:   ${TargetWidth}x${TargetHeight} at $TargetX,$TargetY (panel=${PanelWidth}px)"
 Write-Host "  Single: ${SingleMonitorWidth}x${SingleMonitorHeight} at $SingleMonitorX,$SingleMonitorY (panel=${SinglePanelWidth}px)"
-$cdpStatus = if (Test-CDPAvailable) { "ACTIVE" } else { "not active (will restart VS Code on first use)" }
-Write-Host "  CDP:    localhost:$CDPPort - $cdpStatus"
+$runtimeStatus = Get-CDPRuntimeStatus
+Write-Host "  CDP:    localhost:$CDPPort - $($runtimeStatus.BannerText)"
 Write-Host ""
 Write-Host "  Press Ctrl+C to exit"
 Write-Host "============================================" -ForegroundColor Cyan
@@ -1697,27 +2567,30 @@ if (-not $registeredN) {
 Write-Host ""
 Write-Host "Hotkeys registered. Listening..." -ForegroundColor Green
 
-# Message loop
+# Message loop with integrity watcher polling
 $msg = New-Object WinAPI+MSG
 
 try {
     while ($true) {
-        $result = [WinAPI]::GetMessage([ref]$msg, [IntPtr]::Zero, 0, 0)
+        $processedMessage = $false
 
-        if ($result -eq 0 -or $result -eq -1) {
-            break
-        }
+        while ([WinAPI]::PeekMessage([ref]$msg, [IntPtr]::Zero, 0, 0, [WinAPI]::PM_REMOVE)) {
+            $processedMessage = $true
 
-        if ($msg.message -eq [WinAPI]::WM_HOTKEY) {
-            if ($msg.wParam -eq $HOTKEY_ID) {
-                Invoke-LayoutSnap
-            } elseif ($msg.wParam -eq $HOTKEY_ID_N) {
-                Invoke-SingleMonitorLayout
+            if ($msg.message -eq [WinAPI]::WM_HOTKEY) {
+                if ($msg.wParam -eq $HOTKEY_ID) {
+                    Invoke-LayoutSnap
+                } elseif ($msg.wParam -eq $HOTKEY_ID_N) {
+                    Invoke-SingleMonitorLayout
+                }
             }
+
+            [WinAPI]::TranslateMessage([ref]$msg) | Out-Null
+            [WinAPI]::DispatchMessage([ref]$msg) | Out-Null
         }
 
-        [WinAPI]::TranslateMessage([ref]$msg) | Out-Null
-        [WinAPI]::DispatchMessage([ref]$msg) | Out-Null
+        Invoke-CDPIntegrityWatcherTick
+        Start-Sleep -Milliseconds $(if ($processedMessage) { 25 } else { 150 })
     }
 } finally {
     [WinAPI]::UnregisterHotKey([IntPtr]::Zero, $HOTKEY_ID) | Out-Null
