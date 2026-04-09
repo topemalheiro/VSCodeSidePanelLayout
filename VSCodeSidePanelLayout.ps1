@@ -2,12 +2,16 @@
 # Hotkey: Ctrl+Alt+V (dual monitor), Ctrl+Alt+N (top monitors)
 # Snaps VS Code window and resizes auxiliary bar via CDP sash drag (no cursor movement)
 # Trusts the live CDP endpoint/targets and keeps current windows open if CDP is not ready yet
+# reprompty-mcp: {"toolName":"dual_monitor_layout_bottom","label":"Dual monitor layout (bottom)","description":"Run the Ctrl+Alt+V dual monitor bottom layout","args":["-Once"]}
+# reprompty-mcp: {"toolName":"top_monitors_layout_panel_full","label":"Top monitors layout (panel full)","description":"Run the Ctrl+Alt+N top monitors panel-full layout","args":["-SingleOnce"]}
 
 param(
     [switch]$Once,       # Run Ctrl+Alt+V layout once (dual monitors bottom)
     [switch]$SingleOnce, # Run Ctrl+Alt+N layout once (top monitors)
     [switch]$Duplicate,  # Duplicate window first, then snap
-    [string]$WindowTitle = "",  # Target a specific VS Code window by title substring
+    [string]$WindowTitle = "",  # Target a specific VS Code window by title
+    [Int64]$WindowHandle = 0,   # Target a specific VS Code window by exact handle
+    [string]$LogPath = "",      # Optional per-run layout transcript path
     [switch]$RepairOnly,        # Internal: run fast-check-first repair and exit
     [string]$RepairTriggerSource = "manual", # Internal repair trigger source
     [switch]$StartupRepairOnly, # Re-apply CDP launch hooks and exit
@@ -68,6 +72,43 @@ function Write-RepairLog {
         Add-Content -LiteralPath $RepairLogPath -Value "[$timestamp] [$Level] $Message" -Encoding UTF8
     } catch {
         # Logging should never block repair.
+    }
+}
+
+$script:LayoutTranscriptActive = $false
+
+function Start-LayoutRunLogging {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return
+    }
+
+    try {
+        $parentDir = Split-Path -Parent $Path
+        if (-not [string]::IsNullOrWhiteSpace($parentDir)) {
+            New-Item -ItemType Directory -Path $parentDir -Force -ErrorAction SilentlyContinue | Out-Null
+        }
+
+        Start-Transcript -Path $Path -Force | Out-Null
+        $script:LayoutTranscriptActive = $true
+        Write-Host "  Layout transcript: $Path" -ForegroundColor DarkGray
+    } catch {
+        Write-RepairLog "Failed to start layout transcript at '$Path': $($_.Exception.Message)" "WARN"
+    }
+}
+
+function Stop-LayoutRunLogging {
+    if (-not $script:LayoutTranscriptActive) {
+        return
+    }
+
+    try {
+        Stop-Transcript | Out-Null
+    } catch {
+        Write-RepairLog "Failed to stop layout transcript: $($_.Exception.Message)" "WARN"
+    } finally {
+        $script:LayoutTranscriptActive = $false
     }
 }
 
@@ -1998,6 +2039,31 @@ function Get-VSCodeWindowTitle {
     return $sb.ToString()
 }
 
+function Get-VSCodeProcessWindows {
+    $vsCodeProcesses = Get-Process -Name "Code","Code.real" -ErrorAction SilentlyContinue |
+        Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero }
+
+    $results = @()
+    foreach ($proc in $vsCodeProcesses) {
+        $title = Get-VSCodeWindowTitle -hwnd $proc.MainWindowHandle
+        if ([string]::IsNullOrWhiteSpace($title)) {
+            continue
+        }
+
+        if ($title -notmatch "Visual Studio Code") {
+            continue
+        }
+
+        $results += [pscustomobject]@{
+            Handle = [int64]$proc.MainWindowHandle
+            Title = $title
+            ProcessId = $proc.Id
+        }
+    }
+
+    return $results
+}
+
 function Get-ProcessCommandLine {
     param([int]$ProcessId)
 
@@ -2302,6 +2368,84 @@ function Find-VSCodeWindow {
     return $null
 }
 
+function Find-VSCodeWindow {
+    param(
+        [string]$TargetTitle = "",
+        [Int64]$TargetHandle = 0
+    )
+
+    if ($TargetHandle -gt 0) {
+        $handle = [IntPtr]$TargetHandle
+        $title = Get-VSCodeWindowTitle -hwnd $handle
+        if ([string]::IsNullOrWhiteSpace($title) -or $title -notmatch "Visual Studio Code") {
+            Write-Host "  Requested window handle $TargetHandle is not a visible VS Code window." -ForegroundColor Yellow
+            Write-RepairLog "Requested window handle $TargetHandle is not a visible VS Code window." "WARN"
+            return $null
+        }
+
+        Write-Host "  Exact window handle match: $TargetHandle" -ForegroundColor DarkGray
+        return $handle
+    }
+
+    if ($TargetTitle -ne "") {
+        $windows = @(Get-VSCodeProcessWindows)
+        $exactMatches = @($windows | Where-Object { $_.Title -ieq $TargetTitle })
+
+        if ($exactMatches.Count -eq 1) {
+            Write-Host "  Exact title match found." -ForegroundColor DarkGray
+            return [IntPtr]$exactMatches[0].Handle
+        }
+
+        if ($exactMatches.Count -gt 1) {
+            $matchTitles = ($exactMatches | ForEach-Object { $_.Title }) -join " | "
+            Write-Host "  Ambiguous exact title match for '$TargetTitle': $matchTitles" -ForegroundColor Yellow
+            Write-RepairLog "Ambiguous exact title match for '$TargetTitle': $matchTitles" "WARN"
+            return $null
+        }
+
+        $substringMatches = @(
+            $windows | Where-Object {
+                $_.Title.IndexOf($TargetTitle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+            }
+        )
+
+        if ($substringMatches.Count -eq 1) {
+            Write-Host "  Single substring title match found." -ForegroundColor DarkGray
+            return [IntPtr]$substringMatches[0].Handle
+        }
+
+        if ($substringMatches.Count -gt 1) {
+            $matchTitles = ($substringMatches | ForEach-Object { $_.Title }) -join " | "
+            Write-Host "  Ambiguous substring title match for '$TargetTitle': $matchTitles" -ForegroundColor Yellow
+            Write-RepairLog "Ambiguous substring title match for '$TargetTitle': $matchTitles" "WARN"
+            return $null
+        }
+
+        Write-Host "  No VS Code window matched '$TargetTitle'." -ForegroundColor Yellow
+        Write-RepairLog "No VS Code window matched '$TargetTitle'." "WARN"
+        return $null
+    }
+
+    $foreground = [WinAPI]::GetForegroundWindow()
+    $titleLength = [WinAPI]::GetWindowTextLength($foreground)
+    if ($titleLength -gt 0) {
+        $sb = New-Object System.Text.StringBuilder($titleLength + 1)
+        [WinAPI]::GetWindowText($foreground, $sb, $sb.Capacity) | Out-Null
+        $title = $sb.ToString()
+        if ($title -match "Visual Studio Code") {
+            return $foreground
+        }
+    }
+
+    foreach ($window in Get-VSCodeProcessWindows) {
+        if ($window.Title -match "Visual Studio Code" -or $window.Title -match " - .+ - Visual Studio Code") {
+            return [IntPtr]$window.Handle
+        }
+    }
+
+    return $null
+}
+
 function Set-PanelWidth {
     param(
         [int]$Width,
@@ -2430,7 +2574,7 @@ function Invoke-LayoutSnap {
 
     Write-Host "`n[$(Get-Date -Format 'HH:mm:ss')] Snapping VS Code window..."
 
-    $hwnd = Find-VSCodeWindow -TargetTitle $WindowTitle
+    $hwnd = Find-VSCodeWindow -TargetTitle $WindowTitle -TargetHandle $WindowHandle
 
     if ($null -eq $hwnd -or $hwnd -eq [IntPtr]::Zero) {
         Write-Host "  No VS Code window found$(if ($WindowTitle) {" matching '$WindowTitle'"})!" -ForegroundColor Yellow
@@ -2478,7 +2622,7 @@ function Invoke-LayoutSnap {
 function Invoke-SingleMonitorLayout {
     Write-Host "`n[$(Get-Date -Format 'HH:mm:ss')] Snapping VS Code to top monitors (auxiliary panel full)..."
 
-    $hwnd = Find-VSCodeWindow -TargetTitle $WindowTitle
+    $hwnd = Find-VSCodeWindow -TargetTitle $WindowTitle -TargetHandle $WindowHandle
 
     if ($null -eq $hwnd -or $hwnd -eq [IntPtr]::Zero) {
         Write-Host "  No VS Code window found$(if ($WindowTitle) {" matching '$WindowTitle'"})!" -ForegroundColor Yellow
@@ -2514,86 +2658,92 @@ function Invoke-SingleMonitorLayout {
 # Entry point
 # ============================================================
 
-# If -Once flag, run dual layout and exit
-if ($Once) {
-    if ($Duplicate) {
-        Invoke-LayoutSnap -DuplicateFirst
-    } else {
-        Invoke-LayoutSnap
-    }
-    exit 0
-}
-
-# If -SingleOnce flag, run single/top layout and exit
-if ($SingleOnce) {
-    Invoke-SingleMonitorLayout
-    exit 0
-}
-
-# Main execution with hotkey listener
-Write-Host "============================================" -ForegroundColor Cyan
-Write-Host "  VS Code Side Panel Layout Script" -ForegroundColor White
-Write-Host "============================================" -ForegroundColor Cyan
-Write-Host "  Ctrl+Alt+V - Dual monitor layout (bottom)" -ForegroundColor Yellow
-Write-Host "  Ctrl+Alt+N - Top monitors layout (panel full)" -ForegroundColor Yellow
-Write-Host ""
-Write-Host "  Dual:   ${TargetWidth}x${TargetHeight} at $TargetX,$TargetY (panel=${PanelWidth}px)"
-Write-Host "  Single: ${SingleMonitorWidth}x${SingleMonitorHeight} at $SingleMonitorX,$SingleMonitorY (panel=${SinglePanelWidth}px)"
-$runtimeStatus = Get-CDPRuntimeStatus
-Write-Host "  CDP:    localhost:$CDPPort - $($runtimeStatus.BannerText)"
-Write-Host ""
-Write-Host "  Press Ctrl+C to exit"
-Write-Host "============================================" -ForegroundColor Cyan
-
-# Register hotkeys
-$registered = [WinAPI]::RegisterHotKey([IntPtr]::Zero, $HOTKEY_ID, ($MOD_CONTROL -bor $MOD_ALT), $VK_V)
-$registeredN = [WinAPI]::RegisterHotKey([IntPtr]::Zero, $HOTKEY_ID_N, ($MOD_CONTROL -bor $MOD_ALT), $VK_N)
-
-if (-not $registered) {
-    Write-Host ""
-    Write-Host "ERROR: Failed to register Ctrl+Alt+V hotkey!" -ForegroundColor Red
-    Write-Host "The hotkey may be in use by another application." -ForegroundColor Red
-    exit 1
-}
-
-if (-not $registeredN) {
-    Write-Host ""
-    Write-Host "ERROR: Failed to register Ctrl+Alt+N hotkey!" -ForegroundColor Red
-    Write-Host "The hotkey may be in use by another application." -ForegroundColor Red
-    [WinAPI]::UnregisterHotKey([IntPtr]::Zero, $HOTKEY_ID) | Out-Null
-    exit 1
-}
-
-Write-Host ""
-Write-Host "Hotkeys registered. Listening..." -ForegroundColor Green
-
-# Message loop with integrity watcher polling
-$msg = New-Object WinAPI+MSG
+$oneShotExitCode = $null
+Start-LayoutRunLogging -Path $LogPath
 
 try {
-    while ($true) {
-        $processedMessage = $false
-
-        while ([WinAPI]::PeekMessage([ref]$msg, [IntPtr]::Zero, 0, 0, [WinAPI]::PM_REMOVE)) {
-            $processedMessage = $true
-
-            if ($msg.message -eq [WinAPI]::WM_HOTKEY) {
-                if ($msg.wParam -eq $HOTKEY_ID) {
-                    Invoke-LayoutSnap
-                } elseif ($msg.wParam -eq $HOTKEY_ID_N) {
-                    Invoke-SingleMonitorLayout
-                }
+    if ($Once) {
+        $layoutSucceeded =
+            if ($Duplicate) {
+                Invoke-LayoutSnap -DuplicateFirst
+            } else {
+                Invoke-LayoutSnap
             }
 
-            [WinAPI]::TranslateMessage([ref]$msg) | Out-Null
-            [WinAPI]::DispatchMessage([ref]$msg) | Out-Null
+        $oneShotExitCode = if ($layoutSucceeded) { 0 } else { 1 }
+    } elseif ($SingleOnce) {
+        $layoutSucceeded = Invoke-SingleMonitorLayout
+        $oneShotExitCode = if ($layoutSucceeded) { 0 } else { 1 }
+    } else {
+        Write-Host "============================================" -ForegroundColor Cyan
+        Write-Host "  VS Code Side Panel Layout Script" -ForegroundColor White
+        Write-Host "============================================" -ForegroundColor Cyan
+        Write-Host "  Ctrl+Alt+V - Dual monitor layout (bottom)" -ForegroundColor Yellow
+        Write-Host "  Ctrl+Alt+N - Top monitors layout (panel full)" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  Dual:   ${TargetWidth}x${TargetHeight} at $TargetX,$TargetY (panel=${PanelWidth}px)"
+        Write-Host "  Single: ${SingleMonitorWidth}x${SingleMonitorHeight} at $SingleMonitorX,$SingleMonitorY (panel=${SinglePanelWidth}px)"
+        $runtimeStatus = Get-CDPRuntimeStatus
+        Write-Host "  CDP:    localhost:$CDPPort - $($runtimeStatus.BannerText)"
+        Write-Host ""
+        Write-Host "  Press Ctrl+C to exit"
+        Write-Host "============================================" -ForegroundColor Cyan
+
+        $registered = [WinAPI]::RegisterHotKey([IntPtr]::Zero, $HOTKEY_ID, ($MOD_CONTROL -bor $MOD_ALT), $VK_V)
+        $registeredN = [WinAPI]::RegisterHotKey([IntPtr]::Zero, $HOTKEY_ID_N, ($MOD_CONTROL -bor $MOD_ALT), $VK_N)
+
+        if (-not $registered) {
+            Write-Host ""
+            Write-Host "ERROR: Failed to register Ctrl+Alt+V hotkey!" -ForegroundColor Red
+            Write-Host "The hotkey may be in use by another application." -ForegroundColor Red
+            exit 1
         }
 
-        Invoke-CDPIntegrityWatcherTick
-        Start-Sleep -Milliseconds $(if ($processedMessage) { 25 } else { 150 })
+        if (-not $registeredN) {
+            Write-Host ""
+            Write-Host "ERROR: Failed to register Ctrl+Alt+N hotkey!" -ForegroundColor Red
+            Write-Host "The hotkey may be in use by another application." -ForegroundColor Red
+            [WinAPI]::UnregisterHotKey([IntPtr]::Zero, $HOTKEY_ID) | Out-Null
+            exit 1
+        }
+
+        Write-Host ""
+        Write-Host "Hotkeys registered. Listening..." -ForegroundColor Green
+
+        $msg = New-Object WinAPI+MSG
+
+        try {
+            while ($true) {
+                $processedMessage = $false
+
+                while ([WinAPI]::PeekMessage([ref]$msg, [IntPtr]::Zero, 0, 0, [WinAPI]::PM_REMOVE)) {
+                    $processedMessage = $true
+
+                    if ($msg.message -eq [WinAPI]::WM_HOTKEY) {
+                        if ($msg.wParam -eq $HOTKEY_ID) {
+                            Invoke-LayoutSnap
+                        } elseif ($msg.wParam -eq $HOTKEY_ID_N) {
+                            Invoke-SingleMonitorLayout
+                        }
+                    }
+
+                    [WinAPI]::TranslateMessage([ref]$msg) | Out-Null
+                    [WinAPI]::DispatchMessage([ref]$msg) | Out-Null
+                }
+
+                Invoke-CDPIntegrityWatcherTick
+                Start-Sleep -Milliseconds $(if ($processedMessage) { 25 } else { 150 })
+            }
+        } finally {
+            [WinAPI]::UnregisterHotKey([IntPtr]::Zero, $HOTKEY_ID) | Out-Null
+            [WinAPI]::UnregisterHotKey([IntPtr]::Zero, $HOTKEY_ID_N) | Out-Null
+            Write-Host "Hotkeys unregistered. Goodbye!" -ForegroundColor Cyan
+        }
     }
 } finally {
-    [WinAPI]::UnregisterHotKey([IntPtr]::Zero, $HOTKEY_ID) | Out-Null
-    [WinAPI]::UnregisterHotKey([IntPtr]::Zero, $HOTKEY_ID_N) | Out-Null
-    Write-Host "Hotkeys unregistered. Goodbye!" -ForegroundColor Cyan
+    Stop-LayoutRunLogging
+}
+
+if ($null -ne $oneShotExitCode) {
+    exit $oneShotExitCode
 }
