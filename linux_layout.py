@@ -811,11 +811,36 @@ def set_auxiliary_bar_width_cdp(
 # Main
 # =============================================================================
 
+def load_slot_from_config(slot_letter: str, log_file: Optional[str] = None) -> Optional[dict]:
+    """Load layout coordinates from ~/.reprompty/layouts.json."""
+    try:
+        home = os.environ.get("HOME", ".")
+        config_path = os.path.join(home, ".reprompty", "layouts.json")
+        if not os.path.exists(config_path):
+            return None
+        with open(config_path, "r") as f:
+            data = json.load(f)
+        for slot in data.get("slots", []):
+            if slot.get("letter") == slot_letter:
+                return {
+                    "x": slot.get("windowX", 0),
+                    "y": slot.get("windowY", 0),
+                    "width": slot.get("windowWidth", 1920),
+                    "height": slot.get("windowHeight", 1080),
+                    "panel_width": slot.get("panelWidth", 960),
+                }
+        return None
+    except Exception as e:
+        log(f"Failed to load slot {slot_letter} from layouts.json: {e}", log_file)
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser(description="VS Code: Linux Layout")
     parser.add_argument("--once", action="store_true", help="Run once and exit")
     parser.add_argument("--dual", action="store_true", help="Dual monitor layout")
     parser.add_argument("--single", action="store_true", help="Single monitor layout")
+    parser.add_argument("--slot", type=str, default=None, help="Load coordinates from layouts.json slot (A or B)")
     parser.add_argument("--window-title", type=str, default=None)
     parser.add_argument("--window-handle", type=str, default=None, help="Window ID (xdotool integer or kdotool UUID)")
     parser.add_argument("--log-path", type=str, default=None)
@@ -832,12 +857,23 @@ def main():
     log_file = args.log_path
     panel_side = "left" if args.panel_left else "right"
 
-    # Detect monitors
-    monitors = get_monitor_geometry(log_file)
-    layout_mode = "dual" if args.dual else "single"
-    layout = compute_layout(monitors, layout_mode, panel_side)
+    # Load layout: slot config > auto-detect > fallback
+    if args.slot:
+        layout = load_slot_from_config(args.slot, log_file)
+        if layout:
+            log(f"Loaded slot {args.slot} from layouts.json", log_file)
+        else:
+            log(f"Slot {args.slot} not found in layouts.json, falling back to auto-detect", log_file)
+            layout = None
+    else:
+        layout = None
 
-    # Apply CLI overrides
+    if not layout:
+        monitors = get_monitor_geometry(log_file)
+        layout_mode = "dual" if args.dual else "single"
+        layout = compute_layout(monitors, layout_mode, panel_side)
+
+    # Apply CLI overrides (highest priority)
     if args.x is not None:
         layout["x"] = args.x
     if args.y is not None:
@@ -849,7 +885,7 @@ def main():
     if args.panel_width is not None:
         layout["panel_width"] = args.panel_width
 
-    log(f"Layout: mode={layout_mode} x={layout['x']} y={layout['y']} w={layout['width']} h={layout['height']} panel={layout['panel_width']} side={panel_side}", log_file)
+    log(f"Layout: x={layout['x']} y={layout['y']} w={layout['width']} h={layout['height']} panel={layout['panel_width']} side={panel_side}", log_file)
 
     # Find window
     handle = args.window_handle if args.window_handle else None

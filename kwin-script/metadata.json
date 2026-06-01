@@ -1,0 +1,16 @@
+{
+    "KPackageStructure": "Kwin/Script",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Email": "",
+                "Name": "Reprompty"
+            }
+        ],
+        "Description": "Reprompty window layout helper for VS Code:",
+        "Id": "reprompty-layout",
+        "License": "MIT",
+        "Name": "Reprompty Layout",
+        "Version": "1.0"
+    }
+}
