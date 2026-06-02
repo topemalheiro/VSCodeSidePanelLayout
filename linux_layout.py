@@ -959,7 +959,12 @@ def main():
         if resolved_title:
             log(f"Resolved window title: {resolved_title}", log_file)
 
-    # Try CDP sash drag first (cursor-free)
+    # Move and resize window FIRST so sash drag coordinates are correct
+    if not move_window(wid, layout["x"], layout["y"], layout["width"], layout["height"], log_file):
+        log("ERROR: Failed to move window", log_file)
+        sys.exit(1)
+
+    # Try CDP sash drag now that window is at final geometry
     cdp_success = set_auxiliary_bar_width_cdp(
         target_width=layout["panel_width"],
         window_title=resolved_title,
@@ -977,11 +982,6 @@ def main():
             log("Panel width set in state DB.", log_file)
         else:
             log("WARNING: state DB fallback also failed.", log_file)
-
-    # Move and resize window
-    if not move_window(wid, layout["x"], layout["y"], layout["width"], layout["height"], log_file):
-        log("ERROR: Failed to move window", log_file)
-        sys.exit(1)
 
     # Trigger layout refresh if we used state DB fallback
     if not cdp_success:
