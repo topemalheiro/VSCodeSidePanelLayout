@@ -309,12 +309,67 @@ def _has_xdotool() -> bool:
 # Window finding
 # =============================================================================
 
-def find_vscode_window(title: Optional[str] = None, handle: Optional[str] = None) -> Optional[str]:
-    """Find VS Code: window id using kdotool (Wayland) or xdotool (X11)."""
+def get_active_window(log_file: Optional[str] = None) -> Optional[Tuple[str, str]]:
+    """Get the currently active/focused window ID and title."""
+    # Try kdotool first (KDE Wayland native)
+    if _has_kdotool():
+        try:
+            result = subprocess.run(
+                [KDOTOOL_PATH, "getactivewindow"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                wid = result.stdout.strip()
+                if wid and wid.startswith("{"):
+                    title = get_window_title(wid)
+                    if title:
+                        return (wid, title)
+        except Exception as e:
+            log(f"kdotool getactivewindow error: {e}", log_file)
+
+    # Fallback to xdotool (X11/XWayland)
+    if _has_xdotool():
+        env = os.environ.copy()
+        env["LD_LIBRARY_PATH"] = os.path.expanduser("~/.local/lib") + ":" + env.get("LD_LIBRARY_PATH", "")
+        try:
+            result = subprocess.run(
+                ["xdotool", "getactivewindow"],
+                capture_output=True, text=True, timeout=5, env=env
+            )
+            if result.returncode == 0:
+                wid = result.stdout.strip()
+                if wid:
+                    title_result = subprocess.run(
+                        ["xdotool", "getwindowname", wid],
+                        capture_output=True, text=True, timeout=2, env=env
+                    )
+                    if title_result.returncode == 0:
+                        title = title_result.stdout.strip()
+                        return (wid, title)
+        except Exception as e:
+            log(f"xdotool getactivewindow error: {e}", log_file)
+
+    return None
+
+
+def find_vscode_window(title: Optional[str] = None, handle: Optional[str] = None, log_file: Optional[str] = None) -> Optional[str]:
+    """Find VS Code: window id using kdotool (Wayland) or xdotool (X11).
+    When no specific title or handle is given, prefers the currently active window."""
     if handle is not None:
         return handle
 
-    search_terms = [title] if title else ["Visual Studio Code", "Kilo Code", "VSCodium", "Code: - OSS"]
+    search_terms = [title] if title else ["Visual Studio Code", "Kilo Code", "Kimi Code", "VSCodium", "Code: - OSS"]
+
+    # If no specific title/handle requested, try active window first
+    if not title and not handle:
+        active = get_active_window(log_file)
+        if active:
+            wid, active_title = active
+            if any(term in active_title for term in search_terms):
+                log(f"Using active window: {wid} ('{active_title}')", log_file)
+                return wid
+            else:
+                log(f"Active window '{active_title}' is not a VS Code: editor, falling back to search", log_file)
 
     # Try kdotool first (KDE Wayland native)
     if _has_kdotool():
@@ -352,7 +407,7 @@ def find_vscode_window(title: Optional[str] = None, handle: Optional[str] = None
                             )
                             if name_result.returncode == 0:
                                 name = name_result.stdout.strip()
-                                if any(k in name for k in ["Visual Studio Code", "Kilo Code", "VSCodium", "Code: - OSS"]):
+                                if any(k in name for k in ["Visual Studio Code", "Kilo Code", "Kimi Code", "VSCodium", "Code: - OSS"]):
                                     return str(wid)
                         except Exception:
                             continue
@@ -890,7 +945,7 @@ def main():
     # Find window
     handle = args.window_handle if args.window_handle else None
 
-    wid = find_vscode_window(title=args.window_title, handle=handle)
+    wid = find_vscode_window(title=args.window_title, handle=handle, log_file=log_file)
     if not wid:
         log("ERROR: No VS Code: window found", log_file)
         sys.exit(1)

@@ -2050,7 +2050,7 @@ function Get-VSCodeProcessWindows {
             continue
         }
 
-        if ($title -notmatch "Visual Studio Code") {
+        if ($title -notmatch "(Visual Studio Code|Kilo Code|Kimi Code)") {
             continue
         }
 
@@ -2329,7 +2329,7 @@ function Find-VSCodeWindow {
                     $sb = New-Object System.Text.StringBuilder($titleLength + 1)
                     [WinAPI]::GetWindowText($proc.MainWindowHandle, $sb, $sb.Capacity) | Out-Null
                     $title = $sb.ToString()
-                    if ($title -like "*$TargetTitle*" -and $title -match "Visual Studio Code") {
+                    if ($title -like "*$TargetTitle*" -and $title -match "(Visual Studio Code|Kilo Code|Kimi Code)") {
                         return $proc.MainWindowHandle
                     }
                 }
@@ -2345,7 +2345,7 @@ function Find-VSCodeWindow {
         $sb = New-Object System.Text.StringBuilder($titleLength + 1)
         [WinAPI]::GetWindowText($foreground, $sb, $sb.Capacity) | Out-Null
         $title = $sb.ToString()
-        if ($title -match "Visual Studio Code") {
+        if ($title -match "(Visual Studio Code|Kilo Code|Kimi Code)") {
             return $foreground
         }
     }
@@ -2358,7 +2358,7 @@ function Find-VSCodeWindow {
                 $sb = New-Object System.Text.StringBuilder($titleLength + 1)
                 [WinAPI]::GetWindowText($proc.MainWindowHandle, $sb, $sb.Capacity) | Out-Null
                 $title = $sb.ToString()
-                if ($title -match "Visual Studio Code" -or $title -match " - .+ - Visual Studio Code") {
+                if ($title -match "(Visual Studio Code|Kilo Code|Kimi Code)" -or $title -match " - .+ - (Visual Studio Code|Kilo Code|Kimi Code)") {
                     return $proc.MainWindowHandle
                 }
             }
@@ -2377,7 +2377,7 @@ function Find-VSCodeWindow {
     if ($TargetHandle -gt 0) {
         $handle = [IntPtr]$TargetHandle
         $title = Get-VSCodeWindowTitle -hwnd $handle
-        if ([string]::IsNullOrWhiteSpace($title) -or $title -notmatch "Visual Studio Code") {
+        if ([string]::IsNullOrWhiteSpace($title) -or $title -notmatch "(Visual Studio Code|Kilo Code|Kimi Code)") {
             Write-Host "  Requested window handle $TargetHandle is not a visible VS Code window." -ForegroundColor Yellow
             Write-RepairLog "Requested window handle $TargetHandle is not a visible VS Code window." "WARN"
             return $null
@@ -2432,13 +2432,13 @@ function Find-VSCodeWindow {
         $sb = New-Object System.Text.StringBuilder($titleLength + 1)
         [WinAPI]::GetWindowText($foreground, $sb, $sb.Capacity) | Out-Null
         $title = $sb.ToString()
-        if ($title -match "Visual Studio Code") {
+        if ($title -match "(Visual Studio Code|Kilo Code|Kimi Code)") {
             return $foreground
         }
     }
 
     foreach ($window in Get-VSCodeProcessWindows) {
-        if ($window.Title -match "Visual Studio Code" -or $window.Title -match " - .+ - Visual Studio Code") {
+        if ($window.Title -match "(Visual Studio Code|Kilo Code|Kimi Code)" -or $window.Title -match " - .+ - (Visual Studio Code|Kilo Code|Kimi Code)") {
             return [IntPtr]$window.Handle
         }
     }

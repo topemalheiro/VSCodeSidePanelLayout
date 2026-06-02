@@ -53,7 +53,7 @@ check_kdotool() {
 
 # Check layout script
 check_layout_script() {
-    SCRIPT="/home/tope/Projects/OS Toolkit/Reprompty/VSCodeSidePanelLayout/linux_layout.py"
+    SCRIPT="/home/tope/Projects/OS-Toolkit/Reprompty/VSCodeSidePanelLayout/linux_layout.py"
     if [ -f "$SCRIPT" ]; then
         echo -e "${GREEN}OK${NC}: linux_layout.py found"
     else
