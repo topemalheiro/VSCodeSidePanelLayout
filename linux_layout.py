@@ -373,18 +373,58 @@ def find_vscode_window(title: Optional[str] = None, handle: Optional[str] = None
 
     # Try kdotool first (KDE Wayland native)
     if _has_kdotool():
+        all_matches = []
         for search_term in search_terms:
             try:
                 result = subprocess.run(
-                    [KDOTOOL_PATH, "search", "--title", search_term, "--limit", "1"],
+                    [KDOTOOL_PATH, "search", "--title", search_term],
                     capture_output=True, text=True, timeout=5
                 )
                 if result.returncode == 0:
-                    wid = result.stdout.strip()
-                    if wid and wid.startswith("{"):
-                        return wid
+                    for line in result.stdout.strip().split("\n"):
+                        wid = line.strip()
+                        if wid and wid.startswith("{") and wid not in [m[0] for m in all_matches]:
+                            wtitle = get_window_title(wid)
+                            if wtitle and any(term in wtitle for term in search_terms):
+                                all_matches.append((wid, wtitle))
             except Exception as e:
                 log(f"kdotool search error: {e}")
+
+        if all_matches:
+            if len(all_matches) == 1:
+                return all_matches[0][0]
+
+            # Multiple matches: prefer the one on the current desktop
+            try:
+                desktop_result = subprocess.run(
+                    [KDOTOOL_PATH, "get_desktop"],
+                    capture_output=True, text=True, timeout=5
+                )
+                current_desktop = int(desktop_result.stdout.strip()) if desktop_result.returncode == 0 else None
+            except Exception:
+                current_desktop = None
+
+            if current_desktop is not None:
+                desktop_matches = []
+                for wid, wtitle in all_matches:
+                    try:
+                        dresult = subprocess.run(
+                            [KDOTOOL_PATH, "get_desktop_for_window", wid],
+                            capture_output=True, text=True, timeout=2
+                        )
+                        if dresult.returncode == 0:
+                            wd = int(dresult.stdout.strip())
+                            if wd == current_desktop:
+                                desktop_matches.append((wid, wtitle))
+                    except Exception:
+                        pass
+                if desktop_matches:
+                    log(f"Using VS Code: window on current desktop: {desktop_matches[0][0]} ('{desktop_matches[0][1]}')", log_file)
+                    return desktop_matches[0][0]
+
+            # Fallback to first match
+            log(f"Multiple VS Code: windows found, using first: {all_matches[0][0]} ('{all_matches[0][1]}')", log_file)
+            return all_matches[0][0]
 
     # Fallback to xdotool (X11/XWayland)
     if _has_xdotool():
@@ -457,18 +497,15 @@ def move_window(wid: str, x: int, y: int, width: int, height: int, log_file: Opt
         try:
             # KDE 6: windowsize requires the window to be active first, but
             # windowmove must happen BEFORE activation to avoid desktop-switch drift.
+            # Chain move + activate + resize in a single kdotool invocation
+            # so KWin applies them atomically — no visible "middle point"
             subprocess.run(
-                [KDOTOOL_PATH, "windowmove", wid, str(x), str(y)],
-                capture_output=True, timeout=5,
-            )
-            time.sleep(0.1)
-            subprocess.run(
-                [KDOTOOL_PATH, "windowactivate", wid],
-                capture_output=True, timeout=5,
-            )
-            time.sleep(0.2)
-            subprocess.run(
-                [KDOTOOL_PATH, "windowsize", wid, str(width), str(height)],
+                [
+                    KDOTOOL_PATH,
+                    "windowmove", wid, str(x), str(y),
+                    "windowactivate", wid,
+                    "windowsize", wid, str(width), str(height),
+                ],
                 capture_output=True, timeout=5,
             )
             log(f"Moved window {wid} to {x},{y} size {width}x{height}", log_file)
@@ -593,6 +630,18 @@ def set_auxiliary_bar_width(width: int, log_file: Optional[str] = None) -> bool:
 # =============================================================================
 # CDP (Chrome DevTools Protocol)
 # =============================================================================
+
+# Global persistent CDP WebSocket cache for daemon mode
+_cdp_websockets: Dict[str, MinimalWebSocket] = {}
+
+def _get_cached_ws(ws_url: str) -> Optional[MinimalWebSocket]:
+    ws = _cdp_websockets.get(ws_url)
+    if ws and ws.sock:
+        return ws
+    return None
+
+def _cache_ws(ws_url: str, ws: MinimalWebSocket) -> None:
+    _cdp_websockets[ws_url] = ws
 
 def get_cdp_port() -> int:
     """Get CDP port from DevToolsActivePort or argv.json."""
@@ -752,7 +801,17 @@ def get_auxiliary_bar_sash_position(ws: MinimalWebSocket) -> Optional[dict]:
 
 
 def cdp_drag_sash(ws: MinimalWebSocket, from_x: int, from_y: int, to_x: int, to_y: int):
-    """Drag the sash from one position to another via CDP mouse events."""
+    """Drag the sash from one position to another via CDP mouse events.
+    Single instant move — matches Windows PowerShell behaviour."""
+    # Move physical cursor away from sash to avoid interference
+    # with synthetic CDP mouse events
+    try:
+        subprocess.run(
+            ["ydotool", "mousemove", "0", "0"],
+            capture_output=True, timeout=2
+        )
+    except Exception:
+        pass
     # Mouse pressed at sash
     cdp_send(ws, "Input.dispatchMouseEvent", {
         "type": "mousePressed",
@@ -761,28 +820,18 @@ def cdp_drag_sash(ws: MinimalWebSocket, from_x: int, from_y: int, to_x: int, to_
         "button": "left",
         "clickCount": 1,
     })
-    # Send intermediate mouse moves for reliable large drags.
-    # 'buttons': 1 is required so VS Code: interprets these as drag events.
-    dx = to_x - from_x
-    dy = to_y - from_y
-    distance = max(abs(dx), abs(dy))
-    steps = max(3, distance // 40)  # ~40px per step
-    for i in range(1, steps + 1):
-        ix = from_x + (dx * i // steps)
-        iy = from_y + (dy * i // steps)
-        cdp_send(ws, "Input.dispatchMouseEvent", {
-            "type": "mouseMoved",
-            "x": ix,
-            "y": iy,
-            "button": "left",
-            "buttons": 1,
-        })
-        time.sleep(0.01)
-    # Release
+    # Single instant move to target (no interpolation)
+    cdp_send(ws, "Input.dispatchMouseEvent", {
+        "type": "mouseMoved",
+        "x": to_x,
+        "y": from_y,
+        "button": "left",
+    })
+    # Release at target
     cdp_send(ws, "Input.dispatchMouseEvent", {
         "type": "mouseReleased",
         "x": to_x,
-        "y": to_y,
+        "y": from_y,
         "button": "left",
         "clickCount": 1,
     })
@@ -812,9 +861,16 @@ def set_auxiliary_bar_width_cdp(
         return False
 
     ws = None
+    cached = False
     try:
-        ws = MinimalWebSocket(ws_url)
-        log(f"CDP: Connected to {target.get('title', 'unknown')}", log_file)
+        ws = _get_cached_ws(ws_url)
+        if ws:
+            log(f"CDP: Reusing cached connection to {target.get('title', 'unknown')}", log_file)
+            cached = True
+        else:
+            ws = MinimalWebSocket(ws_url)
+            _cache_ws(ws_url, ws)
+            log(f"CDP: Connected to {target.get('title', 'unknown')}", log_file)
 
         sash_info = get_auxiliary_bar_sash_position(ws)
         if not sash_info or sash_info.get("error"):
@@ -842,7 +898,7 @@ def set_auxiliary_bar_width_cdp(
 
         log(f"CDP: Dragging sash from X={current_sash_x} to X={target_sash_x}", log_file)
         cdp_drag_sash(ws, current_sash_x, sash_y, target_sash_x, sash_y)
-        time.sleep(0.5)
+        time.sleep(0.1)
 
         # Verify
         verify = get_auxiliary_bar_sash_position(ws)
@@ -856,9 +912,11 @@ def set_auxiliary_bar_width_cdp(
 
     except Exception as e:
         log(f"CDP error: {e}", log_file)
+        if ws and ws_url in _cdp_websockets:
+            del _cdp_websockets[ws_url]
         return False
     finally:
-        if ws:
+        if ws and not cached:
             ws.close()
 
 
@@ -890,25 +948,34 @@ def load_slot_from_config(slot_letter: str, log_file: Optional[str] = None) -> O
         return None
 
 
-def main():
-    parser = argparse.ArgumentParser(description="VS Code: Linux Layout")
-    parser.add_argument("--once", action="store_true", help="Run once and exit")
-    parser.add_argument("--dual", action="store_true", help="Dual monitor layout")
-    parser.add_argument("--single", action="store_true", help="Single monitor layout")
-    parser.add_argument("--slot", type=str, default=None, help="Load coordinates from layouts.json slot (A or B)")
-    parser.add_argument("--window-title", type=str, default=None)
-    parser.add_argument("--window-handle", type=str, default=None, help="Window ID (xdotool integer or kdotool UUID)")
-    parser.add_argument("--log-path", type=str, default=None)
-    parser.add_argument("--panel-left", action="store_true", help="Panel on left side")
-    parser.add_argument("--panel-right", action="store_true", help="Panel on right side (default)")
-    parser.add_argument("--cdp-port", type=int, default=None, help="CDP port override")
-    parser.add_argument("--x", type=int, default=None, help="Override window X position")
-    parser.add_argument("--y", type=int, default=None, help="Override window Y position")
-    parser.add_argument("--width", type=int, default=None, help="Override window width")
-    parser.add_argument("--height", type=int, default=None, help="Override window height")
-    parser.add_argument("--panel-width", type=int, default=None, help="Override panel width")
-    args = parser.parse_args()
+# =============================================================================
+# Daemon mode
+# =============================================================================
 
+def build_args_from_json(cmd: dict) -> argparse.Namespace:
+    """Build an argparse Namespace from a JSON command dict."""
+    ns = argparse.Namespace()
+    ns.once = True
+    ns.daemon = False
+    ns.dual = cmd.get("mode") == "dual"
+    ns.single = cmd.get("mode") == "single"
+    ns.slot = cmd.get("slot")
+    ns.window_title = cmd.get("window_title")
+    ns.window_handle = cmd.get("window_handle")
+    ns.log_path = None
+    ns.panel_left = cmd.get("panel_side") == "left"
+    ns.panel_right = cmd.get("panel_side") != "left"
+    ns.cdp_port = None
+    ns.x = cmd.get("x")
+    ns.y = cmd.get("y")
+    ns.width = cmd.get("width")
+    ns.height = cmd.get("height")
+    ns.panel_width = cmd.get("panel_width")
+    return ns
+
+
+def run_layout(args: argparse.Namespace) -> dict:
+    """Run the layout engine with the given args. Returns a result dict."""
     log_file = args.log_path
     panel_side = "left" if args.panel_left else "right"
 
@@ -928,7 +995,7 @@ def main():
         layout_mode = "dual" if args.dual else "single"
         layout = compute_layout(monitors, layout_mode, panel_side)
 
-    # Apply CLI overrides (highest priority)
+    # Apply CLI overrides
     if args.x is not None:
         layout["x"] = args.x
     if args.y is not None:
@@ -942,29 +1009,22 @@ def main():
 
     log(f"Layout: x={layout['x']} y={layout['y']} w={layout['width']} h={layout['height']} panel={layout['panel_width']} side={panel_side}", log_file)
 
-    # Find window
     handle = args.window_handle if args.window_handle else None
-
     wid = find_vscode_window(title=args.window_title, handle=handle, log_file=log_file)
     if not wid:
-        log("ERROR: No VS Code: window found", log_file)
-        sys.exit(1)
+        return {"ok": False, "error": "No VS Code: window found"}
 
     log(f"Found window: {wid}", log_file)
 
-    # Resolve the actual window title so CDP targets the same window
     resolved_title = args.window_title
     if not resolved_title:
         resolved_title = get_window_title(wid)
         if resolved_title:
             log(f"Resolved window title: {resolved_title}", log_file)
 
-    # Move and resize window FIRST so sash drag coordinates are correct
     if not move_window(wid, layout["x"], layout["y"], layout["width"], layout["height"], log_file):
-        log("ERROR: Failed to move window", log_file)
-        sys.exit(1)
+        return {"ok": False, "error": "Failed to move window"}
 
-    # Try CDP sash drag now that window is at final geometry
     cdp_success = set_auxiliary_bar_width_cdp(
         target_width=layout["panel_width"],
         window_title=resolved_title,
@@ -982,13 +1042,189 @@ def main():
             log("Panel width set in state DB.", log_file)
         else:
             log("WARNING: state DB fallback also failed.", log_file)
-
-    # Trigger layout refresh if we used state DB fallback
-    if not cdp_success:
         trigger_layout_refresh(wid, log_file)
 
     log("Layout applied successfully", log_file)
-    sys.exit(0)
+    return {
+        "ok": True,
+        "message": f"Moved window to {layout['x']},{layout['y']} size {layout['width']}x{layout['height']}"
+    }
+
+
+def daemon_main():
+    """Run as a background daemon listening on a Unix domain socket."""
+    socket_path = os.path.join(
+        os.environ.get("XDG_RUNTIME_DIR", "/tmp"),
+        "reprompty",
+        "daemon.sock"
+    )
+    os.makedirs(os.path.dirname(socket_path), exist_ok=True)
+    if os.path.exists(socket_path):
+        os.unlink(socket_path)
+
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(socket_path)
+    server.listen(5)
+    log(f"Daemon listening on {socket_path}")
+
+    try:
+        while True:
+            conn, _ = server.accept()
+            try:
+                data = b""
+                while b"\n" not in data:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                if not data:
+                    continue
+                line = data.decode("utf-8").split("\n")[0].strip()
+                cmd = json.loads(line)
+                if cmd.get("cmd") == "ping":
+                    resp = {"ok": True, "message": "pong"}
+                elif cmd.get("cmd") == "list_windows":
+                    wins = []
+                    for w in find_vscode_window_list():
+                        wins.append({
+                            "uuid": w[0],
+                            "caption": w[1],
+                        })
+                    resp = {"ok": True, "message": f"{len(wins)} window(s) found", "data": wins}
+                else:
+                    args = build_args_from_json(cmd)
+                    resp = run_layout(args)
+                conn.sendall((json.dumps(resp) + "\n").encode("utf-8"))
+            except Exception as e:
+                try:
+                    conn.sendall((json.dumps({"ok": False, "error": str(e)}) + "\n").encode("utf-8"))
+                except Exception:
+                    pass
+            finally:
+                conn.close()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.close()
+        if os.path.exists(socket_path):
+            os.unlink(socket_path)
+
+
+def find_vscode_window_list() -> list:
+    """Return a list of (uuid_or_id, caption) for all VS Code: windows."""
+    results = []
+    if _has_kdotool():
+        for term in ["Visual Studio Code:", "Kilo Code:", "Kimi Code:", "VSCodium", "Code: - OSS"]:
+            try:
+                proc = subprocess.run(
+                    [KDOTOOL_PATH, "search", "--title", term],
+                    capture_output=True, text=True, timeout=5
+                )
+                if proc.returncode == 0:
+                    for line in proc.stdout.strip().split("\n"):
+                        line = line.strip()
+                        if line:
+                            title = get_window_title(line)
+                            if title:
+                                results.append((line, title))
+            except Exception:
+                pass
+    return results
+
+
+def try_daemon_socket(args: argparse.Namespace) -> Optional[dict]:
+    """Try to send the layout command to the running daemon socket.
+    Returns the daemon's response dict, or None if daemon is not available."""
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+    socket_path = os.path.join(runtime_dir, "reprompty", "daemon.sock")
+    if not os.path.exists(socket_path):
+        return None
+
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(3)
+        s.connect(socket_path)
+
+        cmd: dict = {}
+        if args.slot:
+            cmd["slot"] = args.slot
+        if args.dual:
+            cmd["mode"] = "dual"
+        if args.single:
+            cmd["mode"] = "single"
+        if args.window_title:
+            cmd["window_title"] = args.window_title
+        if args.window_handle:
+            cmd["window_handle"] = args.window_handle
+        if args.panel_left:
+            cmd["panel_side"] = "left"
+        elif args.panel_right:
+            cmd["panel_side"] = "right"
+        if args.x is not None:
+            cmd["x"] = args.x
+        if args.y is not None:
+            cmd["y"] = args.y
+        if args.width is not None:
+            cmd["width"] = args.width
+        if args.height is not None:
+            cmd["height"] = args.height
+        if args.panel_width is not None:
+            cmd["panel_width"] = args.panel_width
+
+        s.sendall((json.dumps(cmd) + "\n").encode())
+
+        data = b""
+        while b"\n" not in data:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+
+        s.close()
+        if data:
+            return json.loads(data.decode().strip())
+    except Exception:
+        pass
+    return None
+
+
+def main():
+    parser = argparse.ArgumentParser(description="VS Code: Linux Layout")
+    parser.add_argument("--once", action="store_true", help="Run once and exit")
+    parser.add_argument("--daemon", action="store_true", help="Run as background daemon listening on Unix socket")
+    parser.add_argument("--dual", action="store_true", help="Dual monitor layout")
+    parser.add_argument("--single", action="store_true", help="Single monitor layout")
+    parser.add_argument("--slot", type=str, default=None, help="Load coordinates from layouts.json slot (A or B)")
+    parser.add_argument("--window-title", type=str, default=None)
+    parser.add_argument("--window-handle", type=str, default=None, help="Window ID (xdotool integer or kdotool UUID)")
+    parser.add_argument("--log-path", type=str, default=None)
+    parser.add_argument("--panel-left", action="store_true", help="Panel on left side")
+    parser.add_argument("--panel-right", action="store_true", help="Panel on right side (default)")
+    parser.add_argument("--cdp-port", type=int, default=None, help="CDP port override")
+    parser.add_argument("--x", type=int, default=None, help="Override window X position")
+    parser.add_argument("--y", type=int, default=None, help="Override window Y position")
+    parser.add_argument("--width", type=int, default=None, help="Override window width")
+    parser.add_argument("--height", type=int, default=None, help="Override window height")
+    parser.add_argument("--panel-width", type=int, default=None, help="Override panel width")
+    args = parser.parse_args()
+
+    if args.daemon:
+        daemon_main()
+        return
+
+    # Try daemon socket first for instant, serialized execution
+    daemon_resp = try_daemon_socket(args)
+    if daemon_resp is not None:
+        print(json.dumps(daemon_resp))
+        sys.exit(0 if daemon_resp.get("ok") else 1)
+
+    result = run_layout(args)
+    if result.get("ok"):
+        log(result.get("message", "Done"), args.log_path)
+        sys.exit(0)
+    else:
+        log(f"ERROR: {result.get('error', 'Unknown error')}", args.log_path)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

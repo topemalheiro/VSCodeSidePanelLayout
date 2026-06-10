@@ -1,0 +1,1 @@
+/usr/bin/c++ -Wl,--dependency-file=CMakeFiles/reprompty-layout.dir/link.d "CMakeFiles/reprompty-layout.dir/home/tope/Projects/OS-Toolkit/Reprompty/VSCodeSidePanelLayout/client/src/main.cpp.o" -o reprompty-layout
