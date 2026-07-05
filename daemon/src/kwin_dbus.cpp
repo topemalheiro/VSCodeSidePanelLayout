@@ -392,6 +392,8 @@ bool KWinClient::move_resize(const std::string& uuid, int x, int y, int w, int h
         "    }\n"
         "}\n"
         "if (target) {\n"
+        "    target.fullScreen = false;\n"
+        "    target.maximized = false;\n"
         "    target.frameGeometry = {x: " + std::to_string(x) + ", y: " + std::to_string(y) +
         ", width: " + std::to_string(w) + ", height: " + std::to_string(h) + "};\n"
         "}\n";
