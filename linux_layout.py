@@ -690,6 +690,10 @@ def set_auxiliary_bar_width(width: int, log_file: Optional[str] = None) -> bool:
 # Global persistent CDP WebSocket cache for daemon mode
 _cdp_websockets: Dict[str, MinimalWebSocket] = {}
 
+# What the last successful apply established, so the zoom watcher can restore it.
+# Guarded by _layout_lock. Keys: title, panel_side, fraction, dpr.
+_last_sash_state: Optional[dict] = None
+
 def _get_cached_ws(ws_url: str) -> Optional[MinimalWebSocket]:
     ws = _cdp_websockets.get(ws_url)
     if ws and ws.sock:
@@ -803,9 +807,15 @@ def get_auxiliary_bar_sash_position(ws: MinimalWebSocket) -> Optional[dict]:
     if (!auxBar) return JSON.stringify({ error: 'no-auxiliary-bar', debug: ['auxBar element not found'] });
 
     const auxRect = auxBar.getBoundingClientRect();
-    const isLeft = auxRect.left < window.innerWidth / 2;
+    // Which edge of the window is the bar docked against? Compare the gap on
+    // each side rather than testing the bar's left edge against the midpoint:
+    // a wide right-hand panel starts at or before the centre, so the midpoint
+    // test flips to LEFT exactly when the panel is half the window or wider.
+    const gapLeft = auxRect.left;
+    const gapRight = window.innerWidth - auxRect.right;
+    const isLeft = gapLeft <= gapRight;
     debug.push('auxBar: left=' + Math.round(auxRect.left) + ' top=' + Math.round(auxRect.top) + ' w=' + Math.round(auxRect.width) + ' h=' + Math.round(auxRect.height));
-    debug.push('auxBar side=' + (isLeft ? 'LEFT' : 'RIGHT'));
+    debug.push('auxBar side=' + (isLeft ? 'LEFT' : 'RIGHT') + ' gapL=' + Math.round(gapLeft) + ' gapR=' + Math.round(gapRight));
 
     if (auxRect.width === 0) return JSON.stringify({ error: 'auxiliary-bar-hidden', auxBarWidth: 0, debug: debug });
 
@@ -840,6 +850,7 @@ def get_auxiliary_bar_sash_position(ws: MinimalWebSocket) -> Optional[dict]:
         auxBarLeft: Math.round(auxRect.left),
         auxBarWidth: Math.round(auxRect.width),
         windowWidth: window.innerWidth,
+        devicePixelRatio: window.devicePixelRatio,
         isLeft: isLeft,
         debug: debug
     });
@@ -929,12 +940,13 @@ def cdp_drag_sash(ws: MinimalWebSocket, from_x: int, from_y: int, to_x: int, to_
 
 
 def set_auxiliary_bar_width_cdp(
-    target_width: int,
+    target_width: int = 0,
     window_title: Optional[str] = None,
     expected_window_width: int = 0,
     panel_side: str = "right",
     log_file: Optional[str] = None,
     panel_fraction: Optional[float] = None,
+    sash_fraction: Optional[float] = None,
 ) -> bool:
     """Resize auxiliary bar via CDP sash drag. Returns True on success."""
     log("Resizing auxiliary bar via CDP...", log_file)
@@ -976,7 +988,16 @@ def set_auxiliary_bar_width_cdp(
 
         current_sash_x = sash_info["sashX"]
         sash_y = sash_info["sashY"]
-        is_left = sash_info.get("isLeft", False)
+
+        # Where the bar actually is beats where the config thinks it should be:
+        # the user can move it (workbench.action.moveSideBarLeft/Right) without
+        # the layout slots knowing. panel_side is only a fallback for when the
+        # DOM query could not tell us.
+        detected_left = sash_info.get("isLeft")
+        if detected_left is None:
+            is_left = (panel_side == "left")
+        else:
+            is_left = bool(detected_left)
 
         # window.innerWidth: CSS pixels of the live renderer viewport. This is the
         # only width that shares units with the CDP mouse coordinates dispatched
@@ -991,23 +1012,42 @@ def set_auxiliary_bar_width_cdp(
         # only happens to work at zoom level 0 on a 1.0-scale output -- at 1.2
         # zoom the sash overshoots by exactly that factor, which is what made it
         # drift off-centre on every zoom step.
-        frac = panel_fraction
-        if frac is None:
-            ref_width = expected_window_width if expected_window_width > 0 else viewport_width
-            frac = (target_width / ref_width) if ref_width > 0 else 0.5
-        frac = min(max(float(frac), 0.0), 1.0)
-
-        if is_left or panel_side == "left":
-            target_sash_x = round(viewport_width * frac)
+        # Pin the SASH's offset from the window's left edge, not the panel's share
+        # of the window. The two are only interchangeable on a symmetric span: if
+        # the window covers monitors of different widths (1360 + 1920 here), the
+        # panel is a different width depending on which side it is docked to,
+        # while the seam it should align with never moves. Storing the panel's
+        # share therefore throws the sash off the seam the moment the side bar is
+        # moved to the other side.
+        if sash_fraction is not None:
+            frac = float(sash_fraction)
         else:
-            target_sash_x = round(viewport_width * (1.0 - frac))
+            panel_frac = panel_fraction
+            if panel_frac is None:
+                ref_width = expected_window_width if expected_window_width > 0 else viewport_width
+                panel_frac = (target_width / ref_width) if ref_width > 0 else 0.5
+            panel_frac = min(max(float(panel_frac), 0.0), 1.0)
+            frac = panel_frac if is_left else (1.0 - panel_frac)
 
-        side_str = "LEFT" if (is_left or panel_side == "left") else "RIGHT"
+        frac = min(max(frac, 0.0), 1.0)
+        target_sash_x = round(viewport_width * frac)
+
+        side_str = "LEFT" if is_left else "RIGHT"
         log(
             f"CDP: Sash at X={current_sash_x}, target X={target_sash_x} "
-            f"(panel={frac:.4f} of viewport {viewport_width}px on {side_str})",
+            f"(sash={frac:.4f} of viewport {viewport_width}px, panel on {side_str})",
             log_file,
         )
+
+        # Remember what this apply asked for, so the watcher can restore it after
+        # the viewport changes size (zoom) or the panel is moved to the other side.
+        global _last_sash_state
+        _last_sash_state = {
+            "title": window_title,
+            "sash_fraction": frac,
+            "dpr": sash_info.get("devicePixelRatio"),
+            "is_left": is_left,
+        }
 
         if abs(current_sash_x - target_sash_x) <= 5:
             log("CDP: Already at target position", log_file)
@@ -1062,6 +1102,12 @@ def load_slot_from_config(slot_letter: str, log_file: Optional[str] = None) -> O
                     # fraction survives monitor rescales and zoom changes that
                     # an absolute pixel count does not.
                     "panel_fraction": slot.get("panelFraction"),
+                    # Preferred over both: the sash's offset from the window's
+                    # left edge. Unlike a panel share it does not change when the
+                    # side bar is moved to the opposite side, so it keeps the
+                    # sash on a monitor seam even when the monitors differ in
+                    # width. See set_auxiliary_bar_width_cdp().
+                    "sash_fraction": slot.get("sashFraction"),
                 }
         return None
     except Exception as e:
@@ -1131,6 +1177,7 @@ def run_layout(args: argparse.Namespace) -> dict:
         # any stored fraction -- otherwise the fraction would win and silently
         # ignore the flag, which makes --panel-width useless for testing.
         layout["panel_fraction"] = None
+        layout["sash_fraction"] = None
 
     log(
         f"Layout: x={layout['x']} y={layout['y']} w={layout['width']} h={layout['height']} "
@@ -1161,6 +1208,7 @@ def run_layout(args: argparse.Namespace) -> dict:
         panel_side=panel_side,
         log_file=log_file,
         panel_fraction=layout.get("panel_fraction"),
+        sash_fraction=layout.get("sash_fraction"),
     )
 
     if cdp_success:
@@ -1181,6 +1229,102 @@ def run_layout(args: argparse.Namespace) -> dict:
     }
 
 
+def zoom_watcher_loop(interval: float = 0.5):
+    """Keep the sash on its mark when the window changes out from under it.
+
+    Two things move the sash without anyone asking:
+
+    * Zoom. VS Code stores the auxiliary bar as an ABSOLUTE pixel width, so
+      zooming changes the viewport's CSS width while the bar keeps its size --
+      the sash's fraction of the window shifts on every zoom step.
+    * Moving the side bar to the other side (Ctrl+Alt+~ /
+      workbench.action.moveSideBarLeft/Right). VS Code preserves the bar's
+      WIDTH across the move, so on a window spanning unequal monitors the sash
+      lands nowhere near the seam it came from.
+
+    Watching devicePixelRatio and the docked side (rather than a resize event)
+    means this fires for every zoom path -- keyboard, Ctrl+scroll, the menu --
+    and never when the user deliberately drags the sash themselves, since a
+    manual drag changes neither signal.
+    """
+    global _last_sash_state
+
+    while True:
+        time.sleep(interval)
+        state = _last_sash_state
+        if not state:
+            continue
+
+        ws_url = None
+        try:
+            port = get_cdp_port()
+            targets = get_cdp_targets(port)
+            target = find_matching_target(targets, state.get("title"))
+            if not target:
+                continue
+            ws_url = target.get("webSocketDebuggerUrl")
+            if not ws_url:
+                continue
+
+            ws = _get_cached_ws(ws_url)
+            if not ws:
+                ws = MinimalWebSocket(ws_url)
+                _cache_ws(ws_url, ws)
+
+            probe = cdp_send(ws, "Runtime.evaluate", {
+                "expression": """(() => {
+                    const b = document.getElementById('workbench.parts.auxiliarybar');
+                    if (!b) return null;
+                    const r = b.getBoundingClientRect();
+                    if (r.width === 0) return null;
+                    return JSON.stringify({
+                        dpr: window.devicePixelRatio,
+                        isLeft: r.left <= (window.innerWidth - r.right)
+                    });
+                })()""",
+                "returnByValue": True,
+            })
+            raw = probe.get("result", {}).get("result", {}).get("value")
+            if not raw:
+                continue
+            now = json.loads(raw)
+
+            dpr_before, side_before = state.get("dpr"), state.get("is_left")
+            zoom_changed = (
+                isinstance(now.get("dpr"), (int, float))
+                and isinstance(dpr_before, (int, float))
+                and abs(now["dpr"] - dpr_before) > 1e-6
+            )
+            side_changed = (
+                isinstance(side_before, bool)
+                and bool(now.get("isLeft")) != side_before
+            )
+            if not (zoom_changed or side_changed):
+                continue
+
+            reason = "zoom" if zoom_changed else "side bar moved"
+            log(f"{reason} detected, restoring sash to {state['sash_fraction']:.4f}")
+
+            # Serialise against a layout request landing at the same moment.
+            with _layout_lock:
+                set_auxiliary_bar_width_cdp(
+                    window_title=state.get("title"),
+                    sash_fraction=state["sash_fraction"],
+                )
+
+            # The apply above rewrote _last_sash_state; carry the fraction we
+            # intended forward so repeated zooming keeps converging on the
+            # slot's value rather than drifting a little further each time.
+            if _last_sash_state:
+                _last_sash_state["sash_fraction"] = state["sash_fraction"]
+
+        except Exception as e:
+            log(f"Zoom watcher error: {e}")
+            # A dead socket is the usual cause; drop it so the next pass redials.
+            if ws_url and ws_url in _cdp_websockets:
+                del _cdp_websockets[ws_url]
+
+
 def daemon_main():
     """Run as a background daemon listening on a Unix domain socket."""
     ensure_linux_session_env()
@@ -1197,6 +1341,10 @@ def daemon_main():
     server.bind(socket_path)
     server.listen(5)
     log(f"Daemon listening on {socket_path}")
+
+    watcher = threading.Thread(target=zoom_watcher_loop, name="zoom-watcher", daemon=True)
+    watcher.start()
+    log("Zoom watcher started")
 
     try:
         while True:
