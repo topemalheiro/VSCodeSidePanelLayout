@@ -360,19 +360,12 @@ def get_active_window(log_file: Optional[str] = None) -> Optional[Tuple[str, str
     """Get the currently active/focused window ID and title."""
     # Try kdotool first (KDE Wayland native)
     if _has_kdotool():
-        try:
-            result = subprocess.run(
-                [KDOTOOL_PATH, "getactivewindow"],
-                capture_output=True, text=True, timeout=5
-            )
-            if result.returncode == 0:
-                wid = result.stdout.strip()
-                if wid and wid.startswith("{"):
-                    title = get_window_title(wid)
-                    if title:
-                        return (wid, title)
-        except Exception as e:
-            log(f"kdotool getactivewindow error: {e}", log_file)
+        wid = _kdotool_query(["getactivewindow"], log_file)
+        if wid and wid.startswith("{"):
+            title = get_window_title(wid)
+            if title:
+                return (wid, title)
+            log(f"Active window {wid} reported no title", log_file)
 
     # Fallback to xdotool (X11/XWayland)
     if _has_xdotool():
@@ -392,11 +385,44 @@ def get_active_window(log_file: Optional[str] = None) -> Optional[Tuple[str, str
                     )
                     if title_result.returncode == 0:
                         title = title_result.stdout.strip()
-                        return (wid, title)
+                        # Require a non-empty title, exactly as the kdotool branch
+                        # above already does. On Wayland this xdotool answers with a
+                        # bogus XWayland id (2097152) whose name is empty; accepting
+                        # it shadowed the real active window and sent
+                        # find_vscode_window() down its desktop-blind search path,
+                        # which is what made layouts land on the wrong virtual
+                        # desktop and drag the session along with them.
+                        if title:
+                            return (wid, title)
+                        log(
+                            f"xdotool getactivewindow returned {wid} with an empty "
+                            "title; ignoring it",
+                            log_file,
+                        )
         except Exception as e:
             log(f"xdotool getactivewindow error: {e}", log_file)
 
     return None
+
+
+def get_current_desktop(log_file: Optional[str] = None) -> Optional[int]:
+    """Number of the virtual desktop the user is currently on, or None."""
+    out = _kdotool_query(["get_desktop"], log_file)
+    try:
+        return int(out) if out is not None else None
+    except ValueError:
+        return None
+
+
+def get_desktop_for_window(wid: str, log_file: Optional[str] = None) -> Optional[int]:
+    """Number of the virtual desktop a window lives on, or None."""
+    if not wid.startswith("{"):
+        return None
+    out = _kdotool_query(["get_desktop_for_window", wid], log_file)
+    try:
+        return int(out) if out is not None else None
+    except ValueError:
+        return None
 
 
 def find_vscode_window(title: Optional[str] = None, handle: Optional[str] = None, log_file: Optional[str] = None) -> Optional[str]:
@@ -410,6 +436,8 @@ def find_vscode_window(title: Optional[str] = None, handle: Optional[str] = None
     # If no specific title/handle requested, try active window first
     if not title and not handle:
         active = get_active_window(log_file)
+        if not active:
+            log("Could not determine the active window, falling back to search", log_file)
         if active:
             wid, active_title = active
             if any(term in active_title for term in search_terms):
@@ -420,11 +448,20 @@ def find_vscode_window(title: Optional[str] = None, handle: Optional[str] = None
 
     # Try kdotool first (KDE Wayland native)
     if _has_kdotool():
+        # Scope the search to the desktop the user is actually looking at. Doing
+        # this in the query rather than filtering afterwards is what makes the
+        # result correct on EVERY exit below: the single-match shortcut and the
+        # first-match fallback can then only ever yield a current-desktop window.
+        # Filtering later left both of those paths free to return a window from
+        # another desktop, and windowactivate would then drag the session there.
+        current_desktop = get_current_desktop()
+        scope = ["--desktop", str(current_desktop)] if current_desktop is not None else []
+
         all_matches = []
         for search_term in search_terms:
             try:
                 result = subprocess.run(
-                    [KDOTOOL_PATH, "search", "--title", search_term],
+                    [KDOTOOL_PATH, "search"] + scope + ["--title", search_term],
                     capture_output=True, text=True, timeout=5
                 )
                 if result.returncode == 0:
@@ -438,40 +475,28 @@ def find_vscode_window(title: Optional[str] = None, handle: Optional[str] = None
                 log(f"kdotool search error: {e}")
 
         if all_matches:
-            if len(all_matches) == 1:
-                return all_matches[0][0]
-
-            # Multiple matches: prefer the one on the current desktop
-            try:
-                desktop_result = subprocess.run(
-                    [KDOTOOL_PATH, "get_desktop"],
-                    capture_output=True, text=True, timeout=5
-                )
-                current_desktop = int(desktop_result.stdout.strip()) if desktop_result.returncode == 0 else None
-            except Exception:
-                current_desktop = None
-
-            if current_desktop is not None:
-                desktop_matches = []
-                for wid, wtitle in all_matches:
-                    try:
-                        dresult = subprocess.run(
-                            [KDOTOOL_PATH, "get_desktop_for_window", wid],
-                            capture_output=True, text=True, timeout=2
-                        )
-                        if dresult.returncode == 0:
-                            wd = int(dresult.stdout.strip())
-                            if wd == current_desktop:
-                                desktop_matches.append((wid, wtitle))
-                    except Exception:
-                        pass
-                if desktop_matches:
-                    log(f"Using VS Code: window on current desktop: {desktop_matches[0][0]} ('{desktop_matches[0][1]}')", log_file)
-                    return desktop_matches[0][0]
-
-            # Fallback to first match
-            log(f"Multiple VS Code: windows found, using first: {all_matches[0][0]} ('{all_matches[0][1]}')", log_file)
+            # The search was already scoped to the current desktop, so every match
+            # is a valid target and no post-filtering is needed. (This replaces a
+            # filter that ran get_desktop_for_window per candidate and was bypassed
+            # entirely whenever exactly one window matched.)
+            log(
+                f"Using VS Code: window on desktop {current_desktop}: "
+                f"{all_matches[0][0]} ('{all_matches[0][1]}')",
+                log_file,
+            )
             return all_matches[0][0]
+
+        if scope:
+            # kdotool worked and simply found nothing here. Do NOT fall through to
+            # the xdotool branch below: it searches every desktop and returns an
+            # integer X11 id, which move_window's `wid.startswith("{")` test then
+            # routes down the xdotool path, silently no-opping on a Wayland window.
+            # Better to do nothing and say so than to act on the wrong desktop.
+            log(
+                f"No VS Code: window on desktop {current_desktop}; doing nothing",
+                log_file,
+            )
+            return None
 
     # Fallback to xdotool (X11/XWayland)
     if _has_xdotool():
@@ -508,19 +533,54 @@ def find_vscode_window(title: Optional[str] = None, handle: Optional[str] = None
 # Window manipulation
 # =============================================================================
 
+def _kdotool_query(args: list, log_file: Optional[str] = None,
+                   attempts: int = 4, delay: float = 0.06) -> Optional[str]:
+    """Run a read-only kdotool query, retrying while it answers with nothing.
+
+    kdotool drives KWin by loading a throwaway KWin script per invocation and
+    reading its reply back over D-Bus. That handshake races: measured on this
+    machine, `kdotool get_desktop` returns an EMPTY string roughly 40% of the
+    time, with exit status 0. Every symptom traced back to this -- an empty
+    get_desktop dropped the --desktop scope and let the search pick a window on
+    another virtual desktop, and an empty getwindowname made get_active_window
+    fall through to xdotool's bogus XWayland id. Retrying turns a coin-flip into
+    a reliable answer; four attempts makes an all-empty run about 0.4^4 ~= 2.5%,
+    and each retry costs ~60ms only on the failing path.
+
+    Returns the stripped stdout, or None if every attempt came back empty.
+    """
+    if not _has_kdotool():
+        return None
+    for attempt in range(attempts):
+        try:
+            result = subprocess.run(
+                [KDOTOOL_PATH] + args,
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                out = result.stdout.strip()
+                if out:
+                    return out
+        except Exception as e:
+            log(f"kdotool {' '.join(args)} error: {e}", log_file)
+            return None
+        if attempt < attempts - 1:
+            time.sleep(delay)
+    log(f"kdotool {' '.join(args)} returned empty {attempts}x", log_file)
+    return None
+
+
 def get_window_title(wid: str) -> Optional[str]:
     """Get the title of a window using kdotool or xdotool."""
     is_kdotool = wid.startswith("{")
     if is_kdotool and _has_kdotool():
-        try:
-            result = subprocess.run(
-                [KDOTOOL_PATH, "getwindowname", wid],
-                capture_output=True, text=True, timeout=5
-            )
-            if result.returncode == 0:
-                return result.stdout.strip()
-        except Exception:
-            pass
+        title = _kdotool_query(["getwindowname", wid])
+        if title:
+            return title
+        # Deliberately do NOT fall through to xdotool for a kdotool window id:
+        # xdotool cannot address Wayland windows and answers about an unrelated
+        # XWayland one.
+        return None
     # Fallback to xdotool
     env = os.environ.copy()
     env["LD_LIBRARY_PATH"] = os.path.expanduser("~/.local/lib") + ":" + env.get("LD_LIBRARY_PATH", "")
@@ -555,15 +615,33 @@ def move_window(wid: str, x: int, y: int, width: int, height: int, log_file: Opt
             # windowmove must happen BEFORE activation to avoid desktop-switch drift.
             # Chain move + activate + resize in a single kdotool invocation
             # so KWin applies them atomically — no visible "middle point"
-            subprocess.run(
-                [
-                    KDOTOOL_PATH,
-                    "windowmove", wid, str(x), str(y),
-                    "windowactivate", wid,
-                    "windowsize", wid, str(width), str(height),
-                ],
-                capture_output=True, timeout=5,
+            # kdotool's windowactivate SWITCHES virtual desktop when the target
+            # lives on another one -- "If the window is on another desktop, we
+            # will switch to that desktop" (kdotool --help). A layout request must
+            # never move the user, so drop the activate in that case. Reordering
+            # move-before-activate (below) only ever fixed geometry drift; it does
+            # not stop the switch.
+            window_desktop = get_desktop_for_window(wid, log_file)
+            current_desktop = get_current_desktop(log_file)
+            cross_desktop = (
+                window_desktop is not None
+                and current_desktop is not None
+                and window_desktop != current_desktop
             )
+
+            cmd = [KDOTOOL_PATH, "windowmove", wid, str(x), str(y)]
+            if cross_desktop:
+                log(
+                    f"Window {wid} is on desktop {window_desktop} but the current "
+                    f"desktop is {current_desktop}; skipping activate so the "
+                    "session stays put",
+                    log_file,
+                )
+            else:
+                cmd += ["windowactivate", wid]
+            cmd += ["windowsize", wid, str(width), str(height)]
+
+            subprocess.run(cmd, capture_output=True, timeout=5)
             log(f"Moved window {wid} to {x},{y} size {width}x{height}", log_file)
             return True
         except Exception as e:
@@ -1181,7 +1259,8 @@ def run_layout(args: argparse.Namespace) -> dict:
 
     log(
         f"Layout: x={layout['x']} y={layout['y']} w={layout['width']} h={layout['height']} "
-        f"panel={layout['panel_width']} fraction={layout.get('panel_fraction')} side={panel_side}",
+        f"panel={layout['panel_width']} sash_fraction={layout.get('sash_fraction')} "
+        f"panel_fraction={layout.get('panel_fraction')} side={panel_side}",
         log_file,
     )
 
