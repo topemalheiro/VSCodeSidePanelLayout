@@ -228,12 +228,25 @@ def get_monitor_geometry(log_file: Optional[str] = None) -> list:
                 continue
             pos = out.get("pos", {})
             size = out.get("size", {})
+            # kscreen-doctor reports `pos` in LOGICAL coordinates but `size` in
+            # PHYSICAL (mode) pixels. Mixing the two silently breaks every
+            # geometry calculation the moment any output is not at 100% scale:
+            # a 1920px-wide panel at 1.2 scale occupies only 1600 logical px, so
+            # the next monitor's `pos.x` is 1600 further along, not 1920.
+            # Normalise to logical here so the rest of the module has one unit.
+            try:
+                scale = float(out.get("scale") or 1.0)
+            except (TypeError, ValueError):
+                scale = 1.0
+            if scale <= 0:
+                scale = 1.0
             monitors.append({
                 "name": out.get("name", "unknown"),
                 "x": pos.get("x", 0),
                 "y": pos.get("y", 0),
-                "width": size.get("width", 1920),
-                "height": size.get("height", 1080),
+                "width": round(size.get("width", 1920) / scale),
+                "height": round(size.get("height", 1080) / scale),
+                "scale": scale,
             })
 
         # Sort left-to-right by x position
@@ -843,6 +856,41 @@ def get_auxiliary_bar_sash_position(ws: MinimalWebSocket) -> Optional[dict]:
         return None
 
 
+def wait_for_viewport_settle(
+    ws: MinimalWebSocket,
+    log_file: Optional[str] = None,
+    timeout: float = 1.5,
+    interval: float = 0.05,
+) -> Optional[int]:
+    """Block until window.innerWidth stops changing, then return it.
+
+    move_window() returns as soon as KWin has accepted the geometry, but the
+    renderer reflows asynchronously, so window.innerWidth can still report the
+    PREVIOUS window's width for a beat afterwards. Positioning the sash against
+    that stale number puts it off by the ratio between the old and new widths --
+    e.g. moving 3280 -> 3200 at 1.2 zoom left the sash ~33px right of centre.
+
+    Two consecutive equal reads is enough; the reflow is a single synchronous
+    layout pass, not a gradual animation.
+    """
+    deadline = time.time() + timeout
+    previous = None
+    while time.time() < deadline:
+        resp = cdp_send(ws, "Runtime.evaluate",
+                        {"expression": "window.innerWidth", "returnByValue": True})
+        current = resp.get("result", {}).get("result", {}).get("value")
+        if not isinstance(current, (int, float)):
+            return None
+        current = int(current)
+        if previous is not None and current == previous:
+            return current
+        previous = current
+        time.sleep(interval)
+
+    log(f"CDP: viewport still changing after {timeout}s, using {previous}", log_file)
+    return previous
+
+
 def cdp_drag_sash(ws: MinimalWebSocket, from_x: int, from_y: int, to_x: int, to_y: int):
     """Drag the sash from one position to another via CDP mouse events.
     Single instant move — matches Windows PowerShell behaviour."""
@@ -886,6 +934,7 @@ def set_auxiliary_bar_width_cdp(
     expected_window_width: int = 0,
     panel_side: str = "right",
     log_file: Optional[str] = None,
+    panel_fraction: Optional[float] = None,
 ) -> bool:
     """Resize auxiliary bar via CDP sash drag. Returns True on success."""
     log("Resizing auxiliary bar via CDP...", log_file)
@@ -915,6 +964,10 @@ def set_auxiliary_bar_width_cdp(
             _cache_ws(ws_url, ws)
             log(f"CDP: Connected to {target.get('title', 'unknown')}", log_file)
 
+        # Let the renderer finish reflowing after the window move before reading
+        # any geometry off it -- see wait_for_viewport_settle().
+        wait_for_viewport_settle(ws, log_file)
+
         sash_info = get_auxiliary_bar_sash_position(ws)
         if not sash_info or sash_info.get("error"):
             err = sash_info.get("error") if sash_info else "no response"
@@ -923,17 +976,38 @@ def set_auxiliary_bar_width_cdp(
 
         current_sash_x = sash_info["sashX"]
         sash_y = sash_info["sashY"]
-        effective_width = expected_window_width if expected_window_width > 0 else sash_info["windowWidth"]
         is_left = sash_info.get("isLeft", False)
 
-        # Determine target sash position based on panel side
+        # window.innerWidth: CSS pixels of the live renderer viewport. This is the
+        # only width that shares units with the CDP mouse coordinates dispatched
+        # below, and it already accounts for BOTH VS Code's zoom level and the
+        # output's scale factor.
+        viewport_width = sash_info["windowWidth"]
+
+        # Work in fractions, never absolute pixels. `target_width` and
+        # `expected_window_width` are KWin LOGICAL pixels; their ratio is
+        # unit-free and stays correct at any zoom and any scale. Feeding the
+        # logical width straight in as a CDP coordinate (what this did before)
+        # only happens to work at zoom level 0 on a 1.0-scale output -- at 1.2
+        # zoom the sash overshoots by exactly that factor, which is what made it
+        # drift off-centre on every zoom step.
+        frac = panel_fraction
+        if frac is None:
+            ref_width = expected_window_width if expected_window_width > 0 else viewport_width
+            frac = (target_width / ref_width) if ref_width > 0 else 0.5
+        frac = min(max(float(frac), 0.0), 1.0)
+
         if is_left or panel_side == "left":
-            target_sash_x = target_width
+            target_sash_x = round(viewport_width * frac)
         else:
-            target_sash_x = effective_width - target_width
+            target_sash_x = round(viewport_width * (1.0 - frac))
 
         side_str = "LEFT" if (is_left or panel_side == "left") else "RIGHT"
-        log(f"CDP: Sash at X={current_sash_x}, target X={target_sash_x} (panel={target_width}px on {side_str})", log_file)
+        log(
+            f"CDP: Sash at X={current_sash_x}, target X={target_sash_x} "
+            f"(panel={frac:.4f} of viewport {viewport_width}px on {side_str})",
+            log_file,
+        )
 
         if abs(current_sash_x - target_sash_x) <= 5:
             log("CDP: Already at target position", log_file)
@@ -984,6 +1058,10 @@ def load_slot_from_config(slot_letter: str, log_file: Optional[str] = None) -> O
                     "width": slot.get("windowWidth", 1920),
                     "height": slot.get("windowHeight", 1080),
                     "panel_width": slot.get("panelWidth", 960),
+                    # Optional. When present it wins over panelWidth, because a
+                    # fraction survives monitor rescales and zoom changes that
+                    # an absolute pixel count does not.
+                    "panel_fraction": slot.get("panelFraction"),
                 }
         return None
     except Exception as e:
@@ -1049,8 +1127,16 @@ def run_layout(args: argparse.Namespace) -> dict:
         layout["height"] = args.height
     if args.panel_width is not None:
         layout["panel_width"] = args.panel_width
+        # An explicit width on the command line is a deliberate override, so drop
+        # any stored fraction -- otherwise the fraction would win and silently
+        # ignore the flag, which makes --panel-width useless for testing.
+        layout["panel_fraction"] = None
 
-    log(f"Layout: x={layout['x']} y={layout['y']} w={layout['width']} h={layout['height']} panel={layout['panel_width']} side={panel_side}", log_file)
+    log(
+        f"Layout: x={layout['x']} y={layout['y']} w={layout['width']} h={layout['height']} "
+        f"panel={layout['panel_width']} fraction={layout.get('panel_fraction')} side={panel_side}",
+        log_file,
+    )
 
     handle = args.window_handle if args.window_handle else None
     wid = find_vscode_window(title=args.window_title, handle=handle, log_file=log_file)
@@ -1074,6 +1160,7 @@ def run_layout(args: argparse.Namespace) -> dict:
         expected_window_width=layout["width"],
         panel_side=panel_side,
         log_file=log_file,
+        panel_fraction=layout.get("panel_fraction"),
     )
 
     if cdp_success:
